@@ -1,18 +1,824 @@
+import hashlib
 import math
+import os
 import re
+import sqlite3
+import sys
 from datetime import datetime, date, time, timedelta
 import pandas as pd
 import streamlit as st
-import kakao_database as db
 
-# ==========================================
-# 1. 페이지 설정 & DB 초기화
-# ==========================================
 st.set_page_config(
     page_title="오픈채팅 부방 통합 관리 사이트",
     page_icon="🛡️",
     layout="wide",
 )
+
+
+DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manager.db")
+
+# --- 🏆 등급 기준표 설정 (M1 ~ M4 자동 승급 / MP, MS는 관리자 임명 전용) ---
+GRADE_THRESHOLDS = [
+    (300, "M4"),
+    (200, "M3"),
+    (100, "M2"),
+    (0, "M1")
+]
+
+MANAGER_GRADES = ("MS", "MP")
+
+
+def is_manager_grade(user: dict | None) -> bool:
+    if not user:
+        return False
+    return user.get("grade") in MANAGER_GRADES
+
+
+def calculate_grade(points: int, current_grade: str) -> str:
+    if current_grade in ["MP", "MS"]:
+        return current_grade
+    for threshold, grade in reversed(GRADE_THRESHOLDS):
+        if points >= threshold:
+            return grade
+    return "M1"
+
+
+# --- 📋 정기휴가 기준표 ---
+VACATION_RULES = {
+    "중간/기말고사 (7일)": {"days": 7, "monthly_limit": None, "desc": "가정통신문 인증 시 7일 지급", "guide": "📌 [안내] 중간/기말고사 일정표 또는 가정통신문 사진(캡처)을 인증란에 첨부해 주세요."},
+    "모의고사 (5일)": {"days": 5, "monthly_limit": None, "desc": "학년 인증 시 5일 지급", "guide": "📌 [안내] 모의고사 응시 확인서 또는 학년/성적 관련 인증 자료를 첨부해 주세요."},
+    "연휴 - 추석/설날 (3일)": {"days": 3, "monthly_limit": None, "desc": "명절 연휴 지급", "guide": "📌 [안내] 명절 연휴 기간 정기 휴가입니다. 별도의 증빙 사진 없이 신청 가능합니다."},
+    "공휴일 (2일 - 월 1회)": {"days": 2, "monthly_limit": 1, "desc": "국가지정공휴일, 월 최대 1회", "guide": "📌 [안내] 국가지정공휴일에 한해 인정되며, 월 최대 1회만 신청할 수 있습니다."},
+    "교내/사내행사 1박 이상 (2일 - 월 1회)": {"days": 2, "monthly_limit": 1, "desc": "1박 이상 행사, 월 최대 1회", "guide": "📌 [안내] 수학여행 등 1박 이상 머무는 행사의 가정통신문 또는 예약 증빙 자료를 첨부해 주세요."},
+    "생일 (1일)": {"days": 1, "monthly_limit": None, "desc": "생일 당일 지급", "guide": "📌 [안내] 생일자 본인을 위한 1일 휴가입니다. 별도의 인증 절차가 요구되지 않습니다."},
+    "가족행사 (1일 - 월 1회)": {"days": 1, "monthly_limit": 1, "desc": "가족 행사, 월 최대 1회", "guide": "📌 [안내] 가족 행사(결혼식, 제사 등) 관련 안내장이나 확인 가능한 메모를 남겨주세요."},
+    "교내/사내행사 당일치기 (1일 - 월 2회)": {"days": 1, "monthly_limit": 2, "desc": "당일치기 행사, 월 최대 2회", "guide": "📌 [안내] 현장체험학습 등 당일치기 행사의 가정통신문을 첨부해 주세요."},
+    "관리자재량 - 부상 (월 2회)": {"days": 0, "monthly_limit": 2, "desc": "입원/재활 등 협의 (월 최대 2회)", "guide": "📌 [안내] 진단서 또는 자택 재활 증명 사진을 첨부하고 총괄부방/방장과 협의해 주세요."},
+    "관리자재량 - 가족사 (제한없음)": {"days": 0, "monthly_limit": None, "desc": "중대한 가족사 협의 후 지급", "guide": "📌 [안내] 관련 내용을 기재해 주시면 관리자 협의 후 지급됩니다."}
+}
+
+
+def hash_pw(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL)")
+    cur.execute("SELECT COUNT(*) FROM admins")
+    if cur.fetchone()[0] == 0:
+        cur.execute("INSERT INTO admins (username, password_hash) VALUES (?, ?)", ("admin", hash_pw("1234")))
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nickname TEXT UNIQUE NOT NULL,
+        role TEXT DEFAULT '부방',
+        grade TEXT DEFAULT 'M1',
+        points INTEGER DEFAULT 0,
+        vacation_days INTEGER DEFAULT 0,
+        status TEXT DEFAULT '활동중',
+        joined_at TEXT
+    )
+    """)
+    cur.execute("PRAGMA table_info(members)")
+    m_cols = [col["name"] for col in cur.fetchall()]
+    if "vacation_days" not in m_cols:
+        cur.execute("ALTER TABLE members ADD COLUMN vacation_days INTEGER DEFAULT 0")
+    if "grade" not in m_cols:
+        cur.execute("ALTER TABLE members ADD COLUMN grade TEXT DEFAULT 'M1'")
+
+    # 통합 로그인/회원가입 계정 테이블
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        nickname TEXT UNIQUE NOT NULL,
+        approval_status TEXT DEFAULT '대기중', -- '대기중', '승인완료', '거절됨'
+        created_at TEXT NOT NULL,
+        approved_at TEXT DEFAULT ''
+    )
+    """)
+
+    # 기본 admin 계정을 users 및 members(MP)에 자동 시드
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute("SELECT id FROM users WHERE username = 'admin'")
+    if not cur.fetchone():
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO users (username, password_hash, nickname, approval_status, created_at, approved_at)
+            VALUES (?, ?, ?, '승인완료', ?, ?)
+            """,
+            ("admin", hash_pw("1234"), "총괄관리자", now_str, now_str),
+        )
+    cur.execute("SELECT id FROM members WHERE nickname = '총괄관리자'")
+    if not cur.fetchone():
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO members (nickname, role, grade, points, vacation_days, status, joined_at)
+            VALUES ('총괄관리자', '총괄', 'MP', 0, 0, '활동중', ?)
+            """,
+            (now_str,),
+        )
+
+    # 방/조치사유/조치유형 등 동적 옵션 설정 테이블
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS system_options (
+        opt_key TEXT PRIMARY KEY,
+        opt_value TEXT NOT NULL
+    )
+    """)
+
+    # 전체 앱 사용/접속 기록 테이블
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS activity_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        app_name TEXT NOT NULL,
+        username TEXT NOT NULL,
+        nickname TEXT NOT NULL,
+        grade TEXT DEFAULT '-',
+        action TEXT NOT NULL,
+        detail TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        member_id INTEGER,
+        season TEXT,
+        week TEXT,
+        log_type TEXT,
+        category TEXT,
+        minutes INTEGER DEFAULT 0,
+        points_delta INTEGER NOT NULL,
+        vacation_delta INTEGER DEFAULT 0,
+        memo TEXT,
+        created_at TEXT,
+        FOREIGN KEY(member_id) REFERENCES members(id)
+    )
+    """)
+    cur.execute("PRAGMA table_info(logs)")
+    l_cols = [col["name"] for col in cur.fetchall()]
+    if "season" not in l_cols:
+        cur.execute("ALTER TABLE logs ADD COLUMN season TEXT")
+    if "week" not in l_cols:
+        cur.execute("ALTER TABLE logs ADD COLUMN week TEXT")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS shop_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_name TEXT NOT NULL,
+        price INTEGER NOT NULL,
+        description TEXT,
+        stock INTEGER DEFAULT 99
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS shop_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        member_id INTEGER,
+        item_name TEXT,
+        price INTEGER,
+        status TEXT DEFAULT '대기중',
+        created_at TEXT,
+        FOREIGN KEY(member_id) REFERENCES members(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS vacation_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        member_id INTEGER,
+        category TEXT NOT NULL,
+        requested_days INTEGER NOT NULL,
+        proof_memo TEXT,
+        proof_image TEXT,
+        status TEXT DEFAULT '대기중',
+        request_month TEXT,
+        created_at TEXT,
+        FOREIGN KEY(member_id) REFERENCES members(id)
+    )
+    """)
+    cur.execute("PRAGMA table_info(vacation_requests)")
+    v_cols = [col["name"] for col in cur.fetchall()]
+    if "proof_image" not in v_cols:
+        cur.execute("ALTER TABLE vacation_requests ADD COLUMN proof_image TEXT")
+
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# 🔐 회원가입 / 로그인 / 승인 / 접속기록
+# ==========================================
+def register_user(username: str, password: str, nickname: str) -> tuple[bool, str]:
+    uname = username.strip()
+    nick = nickname.strip()
+    if not uname or not password or not nick:
+        return False, "아이디, 비밀번호, 닉네임을 모두 입력해 주세요."
+    if len(password) < 4:
+        return False, "비밀번호는 4자 이상으로 설정해 주세요."
+
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conn.execute(
+            """
+            INSERT INTO users (username, password_hash, nickname, approval_status, created_at)
+            VALUES (?, ?, ?, '대기중', ?)
+            """,
+            (uname, hash_pw(password), nick, now),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, "이미 사용 중인 아이디 또는 닉네임입니다."
+    conn.close()
+    log_activity("auth", uname, nick, "-", "회원가입신청", "관리자 승인 대기")
+    return True, "회원가입 신청이 완료되었습니다! 관리자(MS/MP) 승인 후 로그인할 수 있습니다."
+
+
+def authenticate_user(username: str, password: str) -> tuple[bool, str, dict | None]:
+    uname = username.strip()
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (uname,)).fetchone()
+    if not row:
+        # 기존 admins 테이블 호환 체크
+        adm = conn.execute("SELECT password_hash FROM admins WHERE username = ?", (uname,)).fetchone()
+        conn.close()
+        if adm and adm["password_hash"] == hash_pw(password):
+            return True, "로그인 성공", {
+                "id": 0,
+                "username": uname,
+                "nickname": "총괄관리자",
+                "grade": "MP",
+                "role": "총괄",
+                "status": "활동중",
+            }
+        return False, "아이디 또는 비밀번호가 올바르지 않습니다.", None
+
+    if row["password_hash"] != hash_pw(password):
+        conn.close()
+        return False, "아이디 또는 비밀번호가 올바르지 않습니다.", None
+
+    if row["approval_status"] == "대기중":
+        conn.close()
+        return False, "⏳ 관리자 승인 대기 중입니다. 승인 후 다시 로그인해 주세요.", None
+    if row["approval_status"] == "거절됨":
+        conn.close()
+        return False, "❌ 가입이 거절된 계정입니다. 관리자에게 문의하세요.", None
+
+    m = conn.execute("SELECT * FROM members WHERE nickname = ?", (row["nickname"],)).fetchone()
+    conn.close()
+
+    if m and m["status"] == "해임":
+        return False, "해임 처리된 계정입니다. 관리자에게 문의하세요.", None
+
+    user_info = {
+        "id": row["id"],
+        "username": row["username"],
+        "nickname": row["nickname"],
+        "grade": m["grade"] if m else "M1",
+        "role": m["role"] if m else "부방",
+        "status": m["status"] if m else "활동중",
+    }
+    return True, "로그인 성공", user_info
+
+
+def refresh_user_info(username: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if not row or row["approval_status"] != "승인완료":
+        conn.close()
+        return None
+    m = conn.execute("SELECT * FROM members WHERE nickname = ?", (row["nickname"],)).fetchone()
+    conn.close()
+    if m and m["status"] == "해임":
+        return None
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "nickname": row["nickname"],
+        "grade": m["grade"] if m else "M1",
+        "role": m["role"] if m else "부방",
+        "status": m["status"] if m else "활동중",
+    }
+
+
+def get_users(status_filter: str | None = None):
+    conn = get_conn()
+    q = """
+        SELECT u.*, COALESCE(m.grade, 'M1') AS grade, COALESCE(m.role, '부방') AS role
+        FROM users u
+        LEFT JOIN members m ON u.nickname = m.nickname
+    """
+    params = ()
+    if status_filter and status_filter != "전체":
+        q += " WHERE u.approval_status = ?"
+        params = (status_filter,)
+    q += " ORDER BY u.id DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_user_approval(user_id: int, new_status: str):
+    conn = get_conn()
+    u = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not u:
+        conn.close()
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    approved_at = now if new_status == "승인완료" else ""
+    conn.execute(
+        "UPDATE users SET approval_status = ?, approved_at = ? WHERE id = ?",
+        (new_status, approved_at, user_id),
+    )
+    if new_status == "승인완료":
+        m = conn.execute("SELECT id FROM members WHERE nickname = ?", (u["nickname"],)).fetchone()
+        if not m:
+            conn.execute(
+                """
+                INSERT INTO members (nickname, role, grade, points, vacation_days, status, joined_at)
+                VALUES (?, '부방', 'M1', 0, 0, '활동중', ?)
+                """,
+                (u["nickname"], now),
+            )
+    conn.commit()
+    conn.close()
+
+
+def log_activity(app_name: str, username: str, nickname: str, grade: str, action: str, detail: str = ""):
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """
+        INSERT INTO activity_logs (app_name, username, nickname, grade, action, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (app_name, username, nickname, grade, action, detail, now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_activity_logs(app_filter: str = "전체", limit: int = 300):
+    conn = get_conn()
+    if app_filter and app_filter != "전체":
+        rows = conn.execute(
+            "SELECT * FROM activity_logs WHERE app_name = ? ORDER BY id DESC LIMIT ?",
+            (app_filter, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM activity_logs ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def render_auth_gate(app_name: str, require_manager: bool = False) -> dict:
+    """
+    모든 앱 상단에서 호출하는 통합 로그인/회원가입 게이트.
+    - require_manager=True 이면 MS, MP 등급만 통과 허용.
+    """
+    if "auth_user" not in st.session_state:
+        st.session_state.auth_user = None
+
+    # 세션에 로그인 정보가 있으면 DB 최신 등급/승인상태 재확인
+    if st.session_state.auth_user:
+        latest = refresh_user_info(st.session_state.auth_user["username"])
+        if not latest:
+            st.session_state.auth_user = None
+        else:
+            st.session_state.auth_user = latest
+
+    if not st.session_state.auth_user:
+        st.title("🔒 로그인 및 회원가입")
+        tab_login, tab_signup = st.tabs(["🔑 로그인", "📝 회원가입"])
+
+        with tab_login:
+            with st.form(f"login_form_{app_name}"):
+                uname = st.text_input("아이디")
+                pw = st.text_input("비밀번호", type="password")
+                if st.form_submit_button("로그인", type="primary", use_container_width=True):
+                    ok, msg, user_info = authenticate_user(uname, pw)
+                    if ok and user_info:
+                        st.session_state.auth_user = user_info
+                        st.session_state[f"visited_{app_name}"] = True
+                        log_activity(
+                            app_name,
+                            user_info["username"],
+                            user_info["nickname"],
+                            user_info["grade"],
+                            "로그인",
+                            f"{app_name} 접속",
+                        )
+                        st.success(f"{user_info['nickname']}님 환영합니다!")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        with tab_signup:
+            st.caption("가입 신청 후 관리자(MS/MP)가 승인해야 로그인할 수 있습니다.")
+            with st.form(f"signup_form_{app_name}"):
+                new_uname = st.text_input("사용할 아이디 *")
+                new_nick = st.text_input("활동 닉네임 * (기존 부방 닉네임과 동일하게 입력)")
+                new_pw = st.text_input("비밀번호 (4자 이상) *", type="password")
+                new_pw2 = st.text_input("비밀번호 확인 *", type="password")
+                if st.form_submit_button("가입 신청하기", use_container_width=True):
+                    if new_pw != new_pw2:
+                        st.error("비밀번호가 서로 일치하지 않습니다.")
+                    else:
+                        ok, msg = register_user(new_uname, new_pw, new_nick)
+                        st.success(msg) if ok else st.error(msg)
+        st.stop()
+
+    user = st.session_state.auth_user
+
+    # 앱 최초 진입 접속 기록 (세션당 1회)
+    visit_key = f"visited_{app_name}"
+    if not st.session_state.get(visit_key):
+        st.session_state[visit_key] = True
+        log_activity(app_name, user["username"], user["nickname"], user["grade"], "앱접속", f"{app_name} 열람")
+
+    # 사이드바 상단에 로그인 계정 & 로그아웃 표시
+    with st.sidebar:
+        st.success(f"👤 **[{user['grade']}] {user['nickname']}** (`{user['username']}`)")
+        if st.button("🚪 로그아웃", key=f"logout_{app_name}", use_container_width=True):
+            log_activity(app_name, user["username"], user["nickname"], user["grade"], "로그아웃", "")
+            st.session_state.auth_user = None
+            st.session_state[visit_key] = False
+            st.rerun()
+        st.divider()
+
+    if require_manager and not is_manager_grade(user):
+        st.error(f"🚫 관리자 전용 페이지입니다. **MS 또는 MP 등급**만 접근할 수 있습니다. (현재 등급: `{user['grade']}`)")
+        st.stop()
+
+    return user
+
+
+# ==========================================
+# 기존 회원/실적/휴가/상점 CRUD
+# ==========================================
+
+def get_option_list(opt_key: str, default_list: list[str]) -> list[str]:
+    conn = get_conn()
+    row = conn.execute("SELECT opt_value FROM system_options WHERE opt_key = ?", (opt_key,)).fetchone()
+    conn.close()
+    if not row or not row["opt_value"].strip():
+        return default_list
+    items = [x.strip() for x in row["opt_value"].splitlines() if x.strip()]
+    return items if items else default_list
+
+
+def save_option_list(opt_key: str, items: list[str]):
+    cleaned = "\n".join([x.strip() for x in items if x.strip()])
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO system_options (opt_key, opt_value) VALUES (?, ?) ON CONFLICT(opt_key) DO UPDATE SET opt_value=excluded.opt_value",
+        (opt_key, cleaned),
+    )
+    conn.commit()
+    conn.close()
+
+def verify_admin(username: str, password: str) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT password_hash FROM admins WHERE username = ?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row["password_hash"] == hash_pw(password))
+
+
+def add_member(nickname: str, role: str = "부방", grade: str = "M1") -> tuple[bool, str]:
+    try:
+        conn = get_conn()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            "INSERT INTO members (nickname, role, grade, points, vacation_days, status, joined_at) VALUES (?, ?, ?, 0, 0, '활동중', ?)",
+            (nickname.strip(), role, grade, now),
+        )
+        conn.commit()
+        conn.close()
+        return True, f"[{nickname}] 등록 완료 (등급: {grade})"
+    except sqlite3.IntegrityError:
+        return False, "이미 존재하는 닉네임입니다."
+
+
+def update_member_grade(member_id: int, new_grade: str):
+    conn = get_conn()
+    conn.execute("UPDATE members SET grade = ? WHERE id = ?", (new_grade, member_id))
+    conn.commit()
+    conn.close()
+
+
+def get_members(only_active=False):
+    conn = get_conn()
+    query = "SELECT * FROM members"
+    if only_active:
+        query += " WHERE status = '활동중'"
+    query += " ORDER BY points DESC, nickname ASC"
+    rows = conn.execute(query).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_member(member_id: int):
+    conn = get_conn()
+    m = conn.execute("SELECT nickname FROM members WHERE id = ?", (member_id,)).fetchone()
+    conn.execute("DELETE FROM logs WHERE member_id = ?", (member_id,))
+    conn.execute("DELETE FROM vacation_requests WHERE member_id = ?", (member_id,))
+    conn.execute("DELETE FROM shop_orders WHERE member_id = ?", (member_id,))
+    if m:
+        conn.execute("DELETE FROM users WHERE nickname = ?", (m["nickname"],))
+    conn.execute("DELETE FROM members WHERE id = ?", (member_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_member_status(member_id: int, status: str):
+    conn = get_conn()
+    conn.execute("UPDATE members SET status = ? WHERE id = ?", (status, member_id))
+    conn.commit()
+    conn.close()
+
+
+def record_performance(member_id: int, season: str, week: str, category: str, minutes: int, points: int, vacation_days: int, memo: str = ""):
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    m = conn.execute("SELECT points, grade FROM members WHERE id = ?", (member_id,)).fetchone()
+    new_points = max(0, m["points"] + points)
+    old_grade = m["grade"] if m["grade"] else "M1"
+
+    if old_grade in ["MP", "MS"]:
+        new_grade = old_grade
+    else:
+        new_grade = calculate_grade(new_points, old_grade)
+
+    conn.execute(
+        "UPDATE members SET points = ?, grade = ?, vacation_days = vacation_days + ? WHERE id = ?",
+        (new_points, new_grade, vacation_days, member_id),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO logs (member_id, season, week, log_type, category, minutes, points_delta, vacation_delta, memo, created_at)
+        VALUES (?, ?, ?, '실적지급', ?, ?, ?, ?, ?, ?)
+        """,
+        (member_id, season, week, category, minutes, points, vacation_days, memo, now),
+    )
+
+    conn.commit()
+    conn.close()
+
+    if new_grade != old_grade:
+        return f" 🎉 등급 변동: [{old_grade}] ➔ [{new_grade}]!"
+    return ""
+
+
+def monthly_reset_and_carryover():
+    conn = get_conn()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    members = conn.execute("SELECT * FROM members WHERE status = '활동중'").fetchall()
+
+    summary = []
+    for m in members:
+        pts = m["points"]
+        current_grade = m["grade"]
+        if pts > 0:
+            carry_vac = math.floor(pts * 0.6)
+            reset_grade = current_grade if current_grade in ["MP", "MS"] else "M1"
+
+            conn.execute(
+                """
+                UPDATE members 
+                SET points = 0, grade = ?, vacation_days = vacation_days + ? 
+                WHERE id = ?
+                """,
+                (reset_grade, carry_vac, m["id"]),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO logs (member_id, season, week, log_type, category, minutes, points_delta, vacation_delta, memo, created_at)
+                VALUES (?, '시즌결산', '결산주차', '월간결산', '포인트리셋/휴가이월', 0, ?, ?, ?, ?)
+                """,
+                (m["id"], -pts, carry_vac, f"월말 결산: {pts}P 리셋 ➔ 60% 내림({carry_vac}일) 휴가 이월", now),
+            )
+            summary.append(f"[{current_grade}] {m['nickname']}: {pts}P ➔ 휴가 +{carry_vac}일")
+
+    conn.commit()
+    conn.close()
+    return summary
+
+
+def get_logs(limit=100):
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT l.*, m.nickname, m.grade 
+        FROM logs l 
+        JOIN members m ON l.member_id = m.id 
+        ORDER BY l.id DESC LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def submit_vacation_request(member_id: int, category: str, custom_days: int, proof_memo: str, proof_image: str) -> tuple[bool, str]:
+    rule = VACATION_RULES.get(category)
+    if not rule:
+        return False, "올바르지 않은 휴가 항목입니다."
+
+    conn = get_conn()
+    current_month = datetime.now().strftime("%Y-%m")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    limit = rule["monthly_limit"]
+    if limit is not None:
+        cur = conn.execute(
+            """
+            SELECT COUNT(*) FROM vacation_requests 
+            WHERE member_id = ? AND category = ? AND request_month = ? AND status != '거절됨'
+            """,
+            (member_id, category, current_month),
+        )
+        count = cur.fetchone()[0]
+        if count >= limit:
+            conn.close()
+            return False, f"이번 달 최대 신청 횟수({limit}회)를 초과했습니다!"
+
+    final_days = custom_days if "관리자재량" in category else rule["days"]
+
+    conn.execute(
+        """
+        INSERT INTO vacation_requests (member_id, category, requested_days, proof_memo, proof_image, status, request_month, created_at)
+        VALUES (?, ?, ?, ?, ?, '대기중', ?, ?)
+        """,
+        (member_id, category, final_days, proof_memo, proof_image, current_month, now),
+    )
+
+    conn.commit()
+    conn.close()
+    return True, f"'{category}' ({final_days}일) 정기휴가 신청이 접수되었습니다!"
+
+
+def get_vacation_requests():
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT v.*, m.nickname, m.grade 
+        FROM vacation_requests v 
+        JOIN members m ON v.member_id = m.id 
+        ORDER BY v.id DESC
+        """
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def process_vacation_request(req_id: int, new_status: str, approved_days: int = None):
+    conn = get_conn()
+    req = conn.execute("SELECT * FROM vacation_requests WHERE id = ?", (req_id,)).fetchone()
+    if not req:
+        conn.close()
+        return
+
+    old_status = req["status"]
+    days_to_give = approved_days if approved_days is not None else req["requested_days"]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn.execute(
+        "UPDATE vacation_requests SET status = ?, requested_days = ? WHERE id = ?",
+        (new_status, days_to_give, req_id),
+    )
+
+    if old_status != "승인완료" and new_status == "승인완료":
+        conn.execute(
+            "UPDATE members SET vacation_days = vacation_days + ? WHERE id = ?",
+            (days_to_give, req["member_id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO logs (member_id, season, week, log_type, category, minutes, points_delta, vacation_delta, memo, created_at)
+            VALUES (?, '시즌통합', '휴가승인주차', '정기휴가승인', ?, 0, 0, ?, ?, ?)
+            """,
+            (req["member_id"], req["category"], days_to_give, f"정기휴가 승인 ({req['proof_memo']})", now),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def add_shop_item(name: str, price: int, desc: str, stock: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO shop_items (item_name, price, description, stock) VALUES (?, ?, ?, ?)",
+        (name, price, desc, stock),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_shop_items():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM shop_items ORDER BY price ASC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_shop_item(item_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+
+
+def order_shop_item(member_id: int, item_id: int) -> tuple[bool, str]:
+    conn = get_conn()
+    m = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
+    item = conn.execute("SELECT * FROM shop_items WHERE id = ?", (item_id,)).fetchone()
+
+    if not m or not item:
+        conn.close()
+        return False, "정보를 찾을 수 없습니다."
+    if m["points"] < item["price"]:
+        conn.close()
+        return False, "포인트가 부족합니다!"
+    if item["stock"] <= 0:
+        conn.close()
+        return False, "상품 재고가 소진되었습니다."
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_pts = m["points"] - item["price"]
+    current_grade = m["grade"]
+    new_grade = current_grade if current_grade in ["MP", "MS"] else calculate_grade(new_pts, current_grade)
+
+    conn.execute("UPDATE members SET points = ?, grade = ? WHERE id = ?", (new_pts, new_grade, member_id))
+    conn.execute("UPDATE shop_items SET stock = stock - 1 WHERE id = ?", (item_id,))
+    conn.execute(
+        """
+        INSERT INTO shop_orders (member_id, item_name, price, status, created_at)
+        VALUES (?, ?, ?, '대기중', ?)
+        """,
+        (member_id, item["item_name"], item["price"], now),
+    )
+    conn.execute(
+        """
+        INSERT INTO logs (member_id, season, week, log_type, category, minutes, points_delta, vacation_delta, memo, created_at)
+        VALUES (?, '시즌통합', '상점주차', '상점구매', '포인트상점', 0, ?, 0, ?, ?)
+        """,
+        (member_id, -item["price"], f"상품 교환: {item['item_name']}", now),
+    )
+
+    conn.commit()
+    conn.close()
+    return True, f"'{item['item_name']}' 교환 신청이 완료되었습니다!"
+
+
+def get_shop_orders():
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT o.*, m.nickname, m.grade 
+        FROM shop_orders o 
+        JOIN members m ON o.member_id = m.id 
+        ORDER BY o.id DESC
+        """
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_order_status(order_id: int, status: str):
+    conn = get_conn()
+    conn.execute("UPDATE shop_orders SET status = ? WHERE id = ?", (status, order_id))
+    conn.commit()
+    conn.close()
+
+db = sys.modules[__name__]
+
+# ==========================================
+# 1. 페이지 설정 & DB 초기화
+# ==========================================
 
 db.init_db()
 
