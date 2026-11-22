@@ -13,53 +13,81 @@ import pandas as pd
 import streamlit as st
 
 # ==========================================
-# 1. 페이지 설정 & 모바일 최적화 CSS
+# 1. 페이지 설정 & 모바일 좌측 트리 메뉴 CSS
 # ==========================================
 st.set_page_config(
     page_title="부방 통합 관리 시스템",
     page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown(
     """
     <style>
-    /* 모바일 & 데스크톱 공용 터치 친화 UI */
+    /* 본문 공용 터치 친화 UI */
     .stButton > button {
         min-height: 44px;
         border-radius: 10px;
         font-weight: 600;
     }
-    /* 탭 가로 스크롤 (모바일에서 탭 글자 깨짐 방지) */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 6px;
-        overflow-x: auto;
-        flex-wrap: nowrap;
-        -webkit-overflow-scrolling: touch;
-        scrollbar-width: none;
+
+    /* 좌측 사이드바 모바일 최적화 */
+    section[data-testid="stSidebar"] {
+        width: 270px !important;
     }
-    .stTabs [data-baseweb="tab-list"]::-webkit-scrollbar {
-        display: none;
+    section[data-testid="stSidebar"] .block-container {
+        padding-top: 1.2rem !important;
+        padding-left: 0.75rem !important;
+        padding-right: 0.75rem !important;
     }
-    .stTabs [data-baseweb="tab"] {
-        white-space: nowrap;
-        padding: 8px 14px;
-        border-radius: 8px;
+
+    /* 대분류 헤더 스타일 */
+    .nav-group-title {
+        font-size: 0.96rem;
+        font-weight: 700;
+        color: #1f2937;
+        margin-top: 12px;
+        margin-bottom: 4px;
+        padding: 4px 6px;
+        border-left: 3px solid #3b82f6;
+        background-color: rgba(59, 130, 246, 0.06);
+        border-radius: 0 6px 6px 0;
     }
+    @media (prefers-color-scheme: dark) {
+        .nav-group-title {
+            color: #f3f4f6;
+            background-color: rgba(59, 130, 246, 0.15);
+        }
+    }
+
+    /* 하위 ㄴ 메뉴 버튼 스타일 (좌측 정렬 & 모바일 터치 영역 확보) */
+    section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] > div {
+        gap: 0.25rem !important;
+    }
+    section[data-testid="stSidebar"] .stButton > button {
+        min-height: 38px !important;
+        padding: 4px 10px !important;
+        justify-content: flex-start !important;
+        text-align: left !important;
+        font-size: 0.88rem !important;
+        font-weight: 500 !important;
+        border-radius: 8px !important;
+    }
+
     /* 모바일 화면 여백 및 폰트 최적화 */
     @media (max-width: 768px) {
         .block-container {
-            padding-top: 1.2rem !important;
+            padding-top: 2.2rem !important;
             padding-left: 0.85rem !important;
             padding-right: 0.85rem !important;
             padding-bottom: 2rem !important;
         }
         h1 {
-            font-size: 1.45rem !important;
+            font-size: 1.4rem !important;
         }
         h2, h3 {
-            font-size: 1.15rem !important;
+            font-size: 1.12rem !important;
         }
     }
     </style>
@@ -525,13 +553,12 @@ def render_auth_gate(site_title: str) -> dict:
         log_activity("unified_app", user["username"], user["nickname"], user["grade"], "앱접속", "사이트 열람")
 
     with st.sidebar:
-        st.success(f"👤 **[{user['grade']}] {user['nickname']}** (`{user['username']}`)")
+        st.success(f"👤 **[{user['grade']}] {user['nickname']}**")
         if st.button("🚪 로그아웃", use_container_width=True):
             log_activity("unified_app", user["username"], user["nickname"], user["grade"], "로그아웃", "")
             st.session_state.auth_user = None
             st.session_state["visited_unified"] = False
             st.rerun()
-        st.divider()
     return user
 
 
@@ -698,7 +725,7 @@ def parse_time_str(raw_time: str) -> time:
 
 
 # ==========================================
-# 5. 메인 실행부 (사이트 제목 & 로그인)
+# 5. 메인 실행부 & 좌측 트리(ㄴ) 사이드바 메뉴
 # ==========================================
 if "--watch-timers" in sys.argv:
     print("⏰ 내풀 타이머 백그라운드 감시 시작 (30초 간격)...")
@@ -716,28 +743,71 @@ SITE_TITLE = get_opt_str("site_title", "오픈채팅 부방 통합 관리")
 current_user = render_auth_gate(SITE_TITLE)
 is_mgr = is_manager_grade(current_user)
 
-# 상단 모바일 친화 네비게이션 + 사이드바 동기화
-nav_items = [
-    "🏆 순위·휴가·상점",
-    "🛡️ 경고/강퇴 관리",
-    "🎙️ 보이스룸 관리",
+# 계층형 메뉴 트리 정의
+MENU_TREE = [
+    ("🏆 순위 · 휴가 · 상점", [
+        ("rank", "순위 / 등급"),
+        ("my_logs", "내 지급내역"),
+        ("vacation", "정기휴가 신청"),
+        ("shop", "포인트 상점"),
+    ]),
+    ("🛡️ 경고/강퇴 · 내풀 관리", [
+        ("mod_input", "기록 입력 (개별/카톡)"),
+        ("mod_score", "주간 점수 & 반영"),
+        ("mod_search", "검색 / 재심 / 증거"),
+        ("mod_timer", "내풀 타이머 현황"),
+        ("mod_audit", "중복 검수 / CSV백업"),
+    ]),
+    ("🎙️ 보이스룸 관리", [
+        ("vr_input", "보룸 기록 입력"),
+        ("vr_score", "주간 시간 & 반영"),
+        ("vr_history", "전체 이력 & CSV"),
+    ]),
 ]
+
 if is_mgr:
-    nav_items.append("📊 관리자(MS/MP)")
+    MENU_TREE.append(
+        ("📊 관리자 (MS/MP)", [
+            ("adm_users", "가입 승인 & 부방 관리"),
+            ("adm_opts", "전체 항목 · 점수 · 사이트 설정"),
+            ("adm_vac", "정기휴가 편집 & 승인"),
+            ("adm_shop", "상점 편집 & 주문 관리"),
+            ("adm_logs", "전체 앱 사용·접속 기록"),
+            ("adm_perf", "실적 수동지급 & 취소"),
+            ("adm_settle", "월말 결산 (리셋/이월)"),
+            ("adm_db", "DB 백업 및 복원"),
+        ])
+    )
 
+if "nav_key" not in st.session_state:
+    st.session_state.nav_key = "rank"
+
+# 좌측 사이드바 트리 렌더링
 with st.sidebar:
-    st.subheader("📌 메뉴 선택")
-page = st.radio("메뉴 이동", nav_items, horizontal=True, label_visibility="collapsed")
+    for group_title, sub_items in MENU_TREE:
+        st.markdown(f'<div class="nav-group-title">{group_title}</div>', unsafe_allow_html=True)
+        for key, label in sub_items:
+            is_selected = st.session_state.nav_key == key
+            if st.button(
+                f"ㄴ {label}",
+                key=f"nav_btn_{key}",
+                type="primary" if is_selected else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state.nav_key = key
+                st.rerun()
+
+nav = st.session_state.nav_key
 
 
 # ==========================================
-# PAGE 1: 순위 · 내 정보 · 휴가 · 상점
+# SECTION 1: 순위 · 휴가 · 상점
 # ==========================================
-if page == "🏆 순위·휴가·상점":
+if nav in ("rank", "my_logs", "vacation", "shop"):
     st.title(f"🏆 {SITE_TITLE}")
-    t1, t2, t3, t4 = st.tabs(["📊 순위/등급", "📋 내 지급내역", "🏖️ 정기휴가", "🎁 포인트상점"])
 
-    with t1:
+    if nav == "rank":
+        st.subheader("📊 순위 / 등급")
         grades = get_grade_thresholds()
         carry_pct = get_opt_int("monthly_carryover_pct", 60)
         grade_info = " | ".join([f"**{g}**: {t}P↑" for t, g in grades])
@@ -757,7 +827,8 @@ if page == "🏆 순위·휴가·상점":
                 hide_index=True,
             )
 
-    with t2:
+    elif nav == "my_logs":
+        st.subheader("📋 내 지급내역")
         members = get_members()
         if members:
             nicks = [m["nickname"] for m in members]
@@ -778,7 +849,8 @@ if page == "🏆 순위·휴가·상점":
                 else:
                     st.info("기록된 지급 내역이 없습니다.")
 
-    with t3:
+    elif nav == "vacation":
+        st.subheader("🏖️ 정기휴가 신청")
         rules = get_vacation_rules()
         with st.expander("📋 정기휴가 기준표 보기"):
             for r in rules:
@@ -824,7 +896,8 @@ if page == "🏆 순위·휴가·상점":
                 log_activity("kakao_user_app", current_user["username"], current_user["nickname"], current_user["grade"], "정기휴가신청", f"{sel_cat} ({req_days}일)")
                 st.success(f"'{sel_cat}' ({req_days}일) 신청 완료!")
 
-    with t4:
+    elif nav == "shop":
+        st.subheader("🎁 포인트 상점")
         members = get_members(only_active=True)
         conn = get_conn()
         items = [dict(r) for r in conn.execute("SELECT * FROM shop_items ORDER BY price ASC").fetchall()]
@@ -866,9 +939,9 @@ if page == "🏆 순위·휴가·상점":
 
 
 # ==========================================
-# PAGE 2: 경고/강퇴 관리
+# SECTION 2: 경고/강퇴 · 내풀 관리
 # ==========================================
-elif page == "🛡️ 경고/강퇴 관리":
+elif nav in ("mod_input", "mod_score", "mod_search", "mod_timer", "mod_audit"):
     cfg = get_tbl_settings("mod_settings")
     wd_name = WEEKDAY_NAMES[cfg["cutoff_weekday"]]
     t_str = f"{cfg['cutoff_hour']:02d}:{cfg['cutoff_minute']:02d}"
@@ -884,7 +957,7 @@ elif page == "🛡️ 경고/강퇴 관리":
     mod_bonus_step = get_opt_int("mod_bonus_step", 10)
     mod_bonus_pt = get_opt_int("mod_bonus_pt", 5)
 
-    st.title("🛡️ 경고/강퇴 관리")
+    st.title("🛡️ 경고/강퇴·내풀 관리")
     st.caption(f"마감: 매주 {wd_name} {t_str} | 세이프 {mod_safe}명 ({mod_fail_pt}점) | {mod_bonus_start}명↑ {mod_bonus_step}명당 +{mod_bonus_pt}점")
 
     active_members = get_members(only_active=True)
@@ -894,6 +967,7 @@ elif page == "🛡️ 경고/강퇴 관리":
     rem = datetime.strptime(f"{cur_cut} {t_str}:00", "%Y-%m-%d %H:%M:%S") - now_dt
 
     with st.sidebar:
+        st.divider()
         if is_mgr and member_nicknames:
             def_i = member_nicknames.index(current_user["nickname"]) if current_user["nickname"] in member_nicknames else 0
             rec_staff = st.selectbox("기록 담당자 (MS/MP 대리)", member_nicknames, index=def_i)
@@ -927,9 +1001,8 @@ elif page == "🛡️ 경고/강퇴 관리":
         nxt = mod_bonus_start + (((cnt - mod_bonus_start) // max(1, mod_bonus_step)) + 1) * mod_bonus_step
         return {"status": "✴️ 가산점", "score": bonus, "next": f"다음({nxt}명)까지 {nxt-cnt}건"}
 
-    t1, t2, t3, t4, t5 = st.tabs(["📝 기록 입력", "📊 주간 점수", "🔍 검색/재심", "⏰ 내풀 타이머", "🛡️ 검수/백업"])
-
-    with t1:
+    if nav == "mod_input":
+        st.subheader("📝 경고/강퇴·내풀 기록 입력")
         with st.expander("1️⃣ 간편 개별 입력", expanded=True):
             a_type = st.selectbox("조치 유형 선택", c_types, key="mod_atype_sel")
             with st.form("mod_single_form", clear_on_submit=True):
@@ -941,7 +1014,7 @@ elif page == "🛡️ 경고/강퇴 관리":
                 room = a3.selectbox("방 선택", c_rooms)
                 if "경고" in a_type:
                     warn_cnt = a4.number_input("경고 횟수 (1~10회)", min_value=1, max_value=10, value=1, step=1)
-                    period_cust = ""
+                    period_sel, period_cust = "", ""
                 else:
                     warn_cnt = 0
                     period_sel = a4.selectbox("조치 기간", ["영구", "1일", "3일", "7일", "14일", "30일", "60일", "90일", "직접 입력"])
@@ -1019,7 +1092,7 @@ elif page == "🛡️ 경고/강퇴 관리":
                     errs.append(f"건너뜀: '{line}'")
                     i += 1
                 if items:
-                    conn = db.get_conn()
+                    conn = get_conn()
                     conn.executemany("INSERT INTO mod_records (target_name, action_date, action_time, action_dt, cutoff_date, room, action_type, reason, staff_name, review_status, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", items)
                     conn.commit()
                     conn.close()
@@ -1027,7 +1100,8 @@ elif page == "🛡️ 경고/강퇴 관리":
                     st.success(f"총 {len(items)}건 저장 완료!")
                     st.rerun()
 
-    with t2:
+    elif nav == "mod_score":
+        st.subheader("📊 주간 점수 & 반영")
         if df_all.empty:
             st.info("기록이 없습니다.")
         else:
@@ -1065,7 +1139,8 @@ elif page == "🛡️ 경고/강퇴 관리":
                         ok_c += 1
                     st.success(f"{ok_c}명 반영 완료!")
 
-    with t3:
+    elif nav == "mod_search":
+        st.subheader("🔍 검색 / 재심 / 증거")
         if not df_all.empty:
             sq = st.text_input("대상자 닉네임 또는 사유 검색")
             rf = st.multiselect("방 필터", options=sorted(df_all["room"].unique().tolist()))
@@ -1106,11 +1181,13 @@ elif page == "🛡️ 경고/강퇴 관리":
                     conn.commit()
                     conn.close()
                     st.rerun()
+        else:
+            st.info("기록이 없습니다.")
 
-    with t4:
+    elif nav == "mod_timer":
         st.subheader("⏰ 내풀 타이머 현황")
         if get_opt_str("naepul_timer_enabled", "0") != "1":
-            st.info("관리자(MS/MP) 대시보드의 **⚙️ 전체 항목 · 점수기준 · 사이트명 설정**에서 내풀 타이머 알림을 켤 수 있습니다.")
+            st.info("관리자(MS/MP) 메뉴의 **ㄴ 전체 항목 · 점수 · 사이트 설정**에서 내풀 타이머 알림을 켤 수 있습니다.")
         if not df_all.empty and "timer_end_dt" in df_all.columns:
             df_tm = df_all[df_all["timer_end_dt"].fillna("") != ""].copy()
             if df_tm.empty:
@@ -1136,7 +1213,8 @@ elif page == "🛡️ 경고/강퇴 관리":
                     check_and_send_naepul_timers()
                     st.rerun()
 
-    with t5:
+    elif nav == "mod_audit":
+        st.subheader("🛡️ 중복 검수 / CSV백업")
         if not df_all.empty:
             dup = df_all.groupby(["target_name", "action_date"]).agg(당일건수=("id", "count"), 담당부방=("staff_name", lambda x: ", ".join(x))).reset_index()
             susp = dup[dup["당일건수"] >= 2]
@@ -1146,12 +1224,14 @@ elif page == "🛡️ 경고/강퇴 관리":
                 st.warning(f"동일 날짜 중복 기록 {len(susp)}건")
                 st.dataframe(susp, use_container_width=True, hide_index=True)
             st.download_button("📊 CSV 다운로드", df_all.to_csv(index=False).encode("utf-8-sig"), f"경고강퇴_{date.today().strftime('%Y%m%d')}.csv", "text/csv", use_container_width=True)
+        else:
+            st.info("기록이 없습니다.")
 
 
 # ==========================================
-# PAGE 3: 보이스룸(보룸) 관리
+# SECTION 3: 보이스룸(보룸) 관리
 # ==========================================
-elif page == "🎙️ 보이스룸 관리":
+elif nav in ("vr_input", "vr_score", "vr_history"):
     cfg = get_tbl_settings("voice_settings")
     wd_name = WEEKDAY_NAMES[cfg["cutoff_weekday"]]
     t_str = f"{cfg['cutoff_hour']:02d}:{cfg['cutoff_minute']:02d}"
@@ -1173,6 +1253,7 @@ elif page == "🎙️ 보이스룸 관리":
     rem = datetime.strptime(f"{cur_cut} {t_str}:00", "%Y-%m-%d %H:%M:%S") - now_dt
 
     with st.sidebar:
+        st.divider()
         if is_mgr and member_nicknames:
             def_i = member_nicknames.index(current_user["nickname"]) if current_user["nickname"] in member_nicknames else 0
             rec_staff = st.selectbox("기록 담당자 (MS/MP 대리)", member_nicknames, index=def_i, key="vr_stf")
@@ -1219,9 +1300,8 @@ elif page == "🎙️ 보이스룸 관리":
     df_all = pd.read_sql_query("SELECT * FROM voice_records ORDER BY end_dt DESC, id DESC", conn)
     conn.close()
 
-    vt1, vt2, vt3 = st.tabs(["📝 기록 입력", "📊 주간 시간 & 반영", "📋 전체 이력"])
-
-    with vt1:
+    if nav == "vr_input":
+        st.subheader("📝 보룸 기록 입력")
         with st.expander("1️⃣ 간편 개별 입력", expanded=True):
             with st.form("vr_single_form", clear_on_submit=True):
                 r_sel = st.selectbox("방 선택", v_rooms)
@@ -1292,7 +1372,7 @@ elif page == "🎙️ 보이스룸 관리":
                     except Exception as e:
                         errs.append(f"'{line}': {e}")
                 if items:
-                    conn = db.get_conn()
+                    conn = get_conn()
                     conn.executemany("INSERT INTO voice_records (staff_name, room, start_date, end_date, end_time, end_dt, cutoff_date, duration_str, duration_seconds, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", items)
                     conn.commit()
                     conn.close()
@@ -1300,7 +1380,8 @@ elif page == "🎙️ 보이스룸 관리":
                     st.success(f"총 {len(items)}건 저장 완료!")
                     st.rerun()
 
-    with vt2:
+    elif nav == "vr_score":
+        st.subheader("📊 주간 시간 & 반영")
         if df_all.empty:
             st.info("기록이 없습니다.")
         else:
@@ -1342,7 +1423,8 @@ elif page == "🎙️ 보이스룸 관리":
                         ok_c += 1
                     st.success(f"{ok_c}명 반영 완료!")
 
-    with vt3:
+    elif nav == "vr_history":
+        st.subheader("📋 전체 이력 & CSV")
         if not df_all.empty:
             qs = st.text_input("부방 또는 방 검색")
             qw = st.multiselect("주차 필터", sorted(df_all["cutoff_date"].unique().tolist(), reverse=True))
@@ -1372,24 +1454,18 @@ elif page == "🎙️ 보이스룸 관리":
                     conn.close()
                     st.rerun()
             st.download_button("📊 CSV 다운로드", df_all.to_csv(index=False).encode("utf-8-sig"), f"보이스룸_{date.today().strftime('%Y%m%d')}.csv", "text/csv", use_container_width=True)
+        else:
+            st.info("기록이 없습니다.")
 
 
 # ==========================================
-# PAGE 4: 관리자 통합 대시보드 (MS/MP 전용)
+# SECTION 4: 관리자 통합 대시보드 (MS/MP 전용)
 # ==========================================
-elif page == "📊 관리자(MS/MP)" and is_mgr:
+elif nav.startswith("adm_") and is_mgr:
     st.title("📊 관리자 통합 대시보드 (MS/MP 전용)")
-    admin_tab = st.selectbox("관리 메뉴 선택", [
-        "👥 회원가입 승인 & 부방 관리",
-        "⚙️ 전체 항목 · 점수기준 · 사이트명 설정",
-        "🏖️ 정기휴가 항목 편집 & 신청 승인",
-        "🎁 포인트 상점 항목 편집 & 주문 관리",
-        "🕵️ 전체 앱 사용·접속 기록",
-        "⭐ 실적 수동 지급 & 히스토리 취소",
-        "🔄 월말 결산 (리셋 & 이월)",
-    ])
 
-    if admin_tab == "👥 회원가입 승인 & 부방 관리":
+    if nav == "adm_users":
+        st.subheader("👥 회원가입 승인 & 부방 관리")
         tu, tm = st.tabs(["📝 가입 승인/거절", "🎖️ 부방 명단 · 등급 · 삭제"])
         with tu:
             sf = st.selectbox("상태 필터", ["대기중", "전체", "승인완료", "거절됨"])
@@ -1464,7 +1540,7 @@ elif page == "📊 관리자(MS/MP)" and is_mgr:
                         conn.close()
                         st.rerun()
 
-    elif admin_tab == "⚙️ 전체 항목 · 점수기준 · 사이트명 설정":
+    elif nav == "adm_opts":
         st.subheader("⚙️ 사이트 이름 · 방 · 사유 · 점수 · 승급 기준 일괄 설정")
         with st.form("all_sys_opts"):
             new_title = st.text_input("🌐 사이트 제목", value=SITE_TITLE)
@@ -1519,7 +1595,8 @@ elif page == "📊 관리자(MS/MP)" and is_mgr:
             ok, msg = send_phone_push("🔔 내풀 알림 테스트", "핸드폰 푸시 알림이 정상 연결되었습니다!")
             st.success(msg) if ok else st.error(msg)
 
-    elif admin_tab == "🏖️ 정기휴가 항목 편집 & 신청 승인":
+    elif nav == "adm_vac":
+        st.subheader("🏖️ 정기휴가 항목 편집 & 신청 승인")
         tv1, tv2 = st.tabs(["✅ 휴가 신청 승인", "✏️ 정기휴가 항목 추가/수정/삭제"])
         with tv1:
             conn = get_conn()
@@ -1590,7 +1667,8 @@ elif page == "📊 관리자(MS/MP)" and is_mgr:
                         conn.close()
                         st.rerun()
 
-    elif admin_tab == "🎁 포인트 상점 항목 편집 & 주문 관리":
+    elif nav == "adm_shop":
+        st.subheader("🎁 포인트 상점 항목 편집 & 주문 관리")
         ts1, ts2 = st.tabs(["📦 상품 추가/수정/삭제", "🛒 교환 주문 처리"])
         with ts1:
             with st.form("adm_shop"):
@@ -1643,7 +1721,8 @@ elif page == "📊 관리자(MS/MP)" and is_mgr:
                         conn.close()
                         st.rerun()
 
-    elif admin_tab == "🕵️ 전체 앱 사용·접속 기록":
+    elif nav == "adm_logs":
+        st.subheader("🕵️ 전체 앱 사용·접속 기록")
         af = st.selectbox("앱 필터", ["전체", "unified_app", "kakao_user_app", "kakao_control_manager", "kakao_voiceroom_manager", "auth"])
         ql = st.text_input("아이디 · 닉네임 · 활동 검색")
         conn = get_conn()
@@ -1660,7 +1739,8 @@ elif page == "📊 관리자(MS/MP)" and is_mgr:
             df_a.columns = ["시간", "앱", "아이디", "닉네임", "등급", "활동", "상세 내용"]
             st.dataframe(df_a, use_container_width=True, hide_index=True)
 
-    elif admin_tab == "⭐ 실적 수동 지급 & 히스토리 취소":
+    elif nav == "adm_perf":
+        st.subheader("⭐ 실적 수동 지급 & 히스토리 취소")
         am = get_members(only_active=True)
         if am:
             mo = {f"[{m.get('grade','M1')}] {m['nickname']} ({m['points']}P)": m["id"] for m in am}
@@ -1705,7 +1785,8 @@ elif page == "📊 관리자(MS/MP)" and is_mgr:
                 st.success("취소 및 원상복구 완료!")
                 st.rerun()
 
-    elif admin_tab == "🔄 월말 결산 (리셋 & 이월)":
+    elif nav == "adm_settle":
+        st.subheader("🔄 월말 결산 (리셋 & 이월)")
         cpct = get_opt_int("monthly_carryover_pct", 60)
         st.warning(f"⚠️ 실행 시 활동중 부방 포인트가 0P로 리셋되고 기존 포인트의 **{cpct}%(내림)**가 휴가로 이월됩니다.")
         if st.button("🚀 월말 결산 실행", type="primary", use_container_width=True):
@@ -1721,3 +1802,25 @@ elif page == "📊 관리자(MS/MP)" and is_mgr:
             conn.commit()
             conn.close()
             st.success("월말 결산 완료!")
+
+    elif nav == "adm_db":
+        st.subheader("💾 DB 백업 및 복원 (회원·기록 보존)")
+        st.info("Streamlit Cloud에서 GitHub 코드를 새로 덮어쓰기 전에 아래 버튼으로 `manager.db`를 내려받아 두시면, 업데이트 후 업로드 한 번으로 모든 회원가입 아이디·점수·기록을 그대로 복원할 수 있습니다.")
+        if os.path.exists(DB_NAME):
+            with open(DB_NAME, "rb") as f:
+                st.download_button(
+                    label="📥 현재 manager.db 전체 백업 다운로드",
+                    data=f.read(),
+                    file_name=f"manager_backup_{date.today().strftime('%Y%m%d')}.db",
+                    mime="application/octet-stream",
+                    type="primary",
+                    use_container_width=True,
+                )
+        st.divider()
+        up_db = st.file_uploader("📤 백업해 둔 manager.db 파일 업로드(복원)", type=["db"])
+        if up_db is not None:
+            if st.button("♻️ 업로드한 DB로 즉시 복원하기", use_container_width=True):
+                with open(DB_NAME, "wb") as f:
+                    f.write(up_db.getvalue())
+                st.success("DB 복원 완료! 새로고침하면 기존 회원과 기록이 모두 복구됩니다.")
+                st.rerun()
