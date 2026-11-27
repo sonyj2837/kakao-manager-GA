@@ -7,6 +7,8 @@ import sqlite3
 import json
 import sys
 import time as py_time
+import calendar
+import calendar
 import urllib.request
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
@@ -218,6 +220,36 @@ def _convert_sql_to_pg(sql: str) -> str:
     return s
 
 
+@st.cache_resource(show_spinner=False)
+def _get_cached_pg_conn(url: str):
+    raw = psycopg2.connect(url, sslmode="require")
+    raw.autocommit = False
+    return PgConnWrapper(raw)
+
+
+def _invalidate_cached_pg_conn():
+    try:
+        _get_cached_pg_conn.clear()
+    except Exception:
+        pass
+
+
+def _release_conn(conn):
+    if conn is None:
+        return
+    if isinstance(conn, PgConnWrapper):
+        try:
+            if conn._conn.info.transaction_status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
+                conn._conn.rollback()
+        except Exception:
+            pass
+        return
+    try:
+        _release_conn(conn)
+    except Exception:
+        pass
+
+
 def get_conn():
     url = get_database_url()
     if url:
@@ -225,10 +257,20 @@ def get_conn():
             st.session_state["db_status_msg"] = "psycopg2-binary 미설치"
             raise RuntimeError("psycopg2-binary가 설치되어 있지 않습니다. requirements.txt에 추가해 주세요.")
         try:
-            raw = psycopg2.connect(url, sslmode="require")
+            wrapper = _get_cached_pg_conn(url)
+            try:
+                if wrapper._conn.closed:
+                    _invalidate_cached_pg_conn()
+                    wrapper = _get_cached_pg_conn(url)
+                elif wrapper._conn.info.transaction_status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
+                    wrapper._conn.rollback()
+            except Exception:
+                _invalidate_cached_pg_conn()
+                wrapper = _get_cached_pg_conn(url)
             st.session_state["db_status_msg"] = "Supabase DB 연결됨"
-            return PgConnWrapper(raw)
+            return wrapper
         except Exception as e:
+            _invalidate_cached_pg_conn()
             st.session_state["db_status_msg"] = f"Supabase 연결 실패: {e}"
             raise
     st.session_state["db_status_msg"] = "로컬 SQLite 모드 (재시작 시 초기화 주의)"
@@ -247,7 +289,7 @@ def read_sql_df(sql: str, params: tuple | list = ()) -> pd.DataFrame:
             return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
         return pd.read_sql_query(sql, conn, params=params)
     finally:
-        conn.close()
+        _release_conn(conn)
 
 
 def init_db():
@@ -351,9 +393,13 @@ def init_db():
             item_name TEXT NOT NULL,
             price INTEGER NOT NULL,
             description TEXT,
-            stock INTEGER DEFAULT 99
+            stock INTEGER DEFAULT 99,
+            early_access_days INTEGER DEFAULT 0,
+            released_at TEXT DEFAULT ''
         )
         """)
+        cur.execute("ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS early_access_days INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE shop_items ADD COLUMN IF NOT EXISTS released_at TEXT DEFAULT ''")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS shop_orders (
@@ -601,9 +647,17 @@ def init_db():
             item_name TEXT NOT NULL,
             price INTEGER NOT NULL,
             description TEXT,
-            stock INTEGER DEFAULT 99
+            stock INTEGER DEFAULT 99,
+            early_access_days INTEGER DEFAULT 0,
+            released_at TEXT DEFAULT ''
         )
         """)
+        cur.execute("PRAGMA table_info(shop_items)")
+        shop_cols = [c["name"] for c in cur.fetchall()]
+        if "early_access_days" not in shop_cols:
+            cur.execute("ALTER TABLE shop_items ADD COLUMN early_access_days INTEGER DEFAULT 0")
+        if "released_at" not in shop_cols:
+            cur.execute("ALTER TABLE shop_items ADD COLUMN released_at TEXT DEFAULT ''")
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS shop_orders (
@@ -722,7 +776,7 @@ def init_db():
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS suggestion_box (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             author_username TEXT NOT NULL,
             author_nickname TEXT NOT NULL,
             author_grade TEXT DEFAULT '-',
@@ -739,7 +793,7 @@ def init_db():
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS site_chat_messages (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL,
             nickname TEXT NOT NULL,
             grade TEXT DEFAULT '-',
@@ -750,7 +804,7 @@ def init_db():
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS alba_jobs (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             description TEXT DEFAULT '',
             reward_points INTEGER NOT NULL DEFAULT 10,
@@ -769,11 +823,17 @@ def init_db():
         """)
 
     conn.commit()
-    conn.close()
+    _release_conn(conn)
+
+
+@st.cache_resource(show_spinner=False)
+def _run_init_db_once(db_mode_key: str):
+    init_db()
+    return True
 
 
 try:
-    init_db()
+    _run_init_db_once("pg" if is_postgres_configured() else "sq")
 except Exception as _init_err:
     st.session_state["db_status_msg"] = f"DB 초기화 경고: {_init_err}"
 
@@ -781,11 +841,29 @@ except Exception as _init_err:
 # ==========================================
 # 3. 동적 옵션 & 기준표 조회/저장 함수
 # ==========================================
-def get_opt_str(key: str, default: str) -> str:
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_all_options(db_mode_key: str) -> dict[str, str]:
     conn = get_conn()
-    row = conn.execute("SELECT opt_value FROM system_options WHERE opt_key = ?", (key,)).fetchone()
-    conn.close()
-    return row["opt_value"] if (row and row["opt_value"].strip()) else default
+    rows = conn.execute("SELECT opt_key, opt_value FROM system_options").fetchall()
+    _release_conn(conn)
+    return {str(r["opt_key"]): str(r["opt_value"]) for r in rows}
+
+
+def _clear_fast_caches():
+    try:
+        _cached_all_options.clear()
+        _cached_members.clear()
+        _cached_vacation_rules.clear()
+        _cached_tbl_settings.clear()
+    except Exception:
+        pass
+
+
+def get_opt_str(key: str, default: str) -> str:
+    db_key = "pg" if is_postgres_configured() else "sq"
+    opts = _cached_all_options(db_key)
+    val = opts.get(key, "")
+    return val if val.strip() else default
 
 
 def set_opt_str(key: str, val: str):
@@ -801,7 +879,8 @@ def set_opt_str(key: str, val: str):
             (key, str(val)),
         )
     conn.commit()
-    conn.close()
+    _release_conn(conn)
+    _clear_fast_caches()
 
 
 def get_opt_int(key: str, default: int) -> int:
@@ -814,7 +893,7 @@ def get_opt_int(key: str, default: int) -> int:
 def get_option_list(opt_key: str, default_list: list[str]) -> list[str]:
     conn = get_conn()
     row = conn.execute("SELECT opt_value FROM system_options WHERE opt_key = ?", (opt_key,)).fetchone()
-    conn.close()
+    _release_conn(conn)
     if not row or not row["opt_value"].strip():
         return default_list
     items = [x.strip() for x in row["opt_value"].splitlines() if x.strip()]
@@ -848,11 +927,275 @@ def is_manager_grade(user: dict | None) -> bool:
     return str(user.get("grade", "")).upper() in MANAGER_GRADES or str(user.get("username", "")) == "admin"
 
 
-def get_vacation_rules() -> list[dict]:
+def get_grade_fee_discount_pct(grade: str) -> int:
+    g = (grade or "M1").upper()
+    mapping = {
+        "M1": 0,
+        "M2": 5,
+        "M3": 10,
+        "M4": 15,
+        "MS": 20,
+        "MP": 20,
+    }
+    return mapping.get(g, 0)
+
+
+def get_grade_rank_priority(grade: str) -> int:
+    order = {"MP": 6, "MS": 5, "M4": 4, "M3": 3, "M2": 2, "M1": 1}
+    return order.get((grade or "M1").upper(), 1)
+
+
+def is_early_access_eligible(grade: str) -> bool:
+    return (grade or "M1").upper() in ("M3", "M4", "MS", "MP")
+
+
+def normalize_room_name(raw: str, known_rooms: list[str]) -> str:
+    s = re.sub(r"\s+", "", raw or "")
+    if not s:
+        return ""
+    alias = {
+        "거방1호점": "거방1",
+        "1호점": "거방1",
+        "거방": "거방1",
+        "거래방": "거래방",
+        "소통방": "소통방",
+        "2호점": "2호점",
+        "거방2호점": "2호점",
+    }
+    if s in alias:
+        return alias[s]
+    for kr in known_rooms:
+        if re.sub(r"\s+", "", kr) == s:
+            return kr
+    return raw.strip()
+
+
+def parse_korean_time_token(txt: str) -> time | None:
+    m1 = re.search(r"(\d{1,2})\s*:\s*(\d{2})(?:\s*:\s*\d{2})?", txt)
+    if m1:
+        h, mi = int(m1.group(1)), int(m1.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return time(h, mi)
+    m2 = re.search(r"(오전|오후)?\s*(\d{1,2})\s*시\s*(\d{1,2})\s*분?", txt)
+    if m2:
+        ampm, h, mi = m2.group(1), int(m2.group(2)), int(m2.group(3))
+        if ampm == "오후" and h < 12:
+            h += 12
+        elif ampm == "오전" and h == 12:
+            h = 0
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return time(h, mi)
+    return None
+
+
+def parse_korean_date_token(txt: str, default_date: date) -> tuple[date, str]:
+    # Case 1: 26.11.07.10:44 or 2026.10.13 or 26.11.06 or 2026-10-13
+    m = re.search(r"(20\d{2}|\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", txt)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        try:
+            return date(y, mo, d), m.group(0)
+        except ValueError:
+            pass
+    # Case 2: 261111 (6-digit YYMMDD) or 20261111
+    m6 = re.search(r"(?<!\d)(20\d{6}|\d{6})(?!\d)", txt)
+    if m6:
+        digits = m6.group(1)
+        try:
+            return parse_date_str(digits), digits
+        except ValueError:
+            pass
+    # Case 3: 11월 6일
+    m_kr = re.search(r"(?:(20\d{2}|\d{2})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일", txt)
+    if m_kr:
+        y = int(m_kr.group(1)) if m_kr.group(1) else default_date.year
+        if y < 100:
+            y += 2000
+        try:
+            return date(y, int(m_kr.group(2)), int(m_kr.group(3))), m_kr.group(0)
+        except ValueError:
+            pass
+    return default_date, ""
+
+
+def smart_parse_mod_paste(raw_text: str, known_rooms: list[str], default_staff: str) -> list[dict]:
+    """
+    AI 없이 제각각인 카톡 경고/강퇴/내풀 양식을 역할 기반으로 파싱하여 미리보기 리스트로 반환합니다.
+    """
+    raw_lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+    if not raw_lines:
+        return []
+
+    # 1) 블록(레코드 단위) 분할
+    blocks: list[list[str]] = []
+    cur: list[str] = []
+
+    def is_new_record_start(line: str, prev_lines: list[str]) -> bool:
+        if not prev_lines:
+            return False
+        # @닉네임으로 새로 시작하는 경우
+        if line.startswith("@"):
+            return True
+        # '- 닉 :' 패턴
+        if re.match(r"^[-•*]\s*닉\s*[:：]", line):
+            return True
+        # 슬래시 3개 이상 한 줄 완결형
+        if line.count("/") >= 3 and not line.startswith("사유") and not line.startswith("추방사유"):
+            return True
+        # 이전 블록에 이미 사유/날짜가 들어있고, 새 줄이 조치 키워드(경고/강퇴/추방/내풀)를 포함한 닉네임 줄인 경우
+        prev_joined = " ".join(prev_lines)
+        has_prev_body = any(k in prev_joined for k in ("사유", "경고", "강퇴", "추방", "내풀", "영구", "클홍"))
+        has_new_header = bool(re.search(r"(경고\s*\d*|강퇴|추방|영구|내풀)", line)) and not re.match(r"^(사유|추방사유|소통방|거방|거래방|2호점|\d{2,4}[.\-/])", line)
+        if has_prev_body and has_new_header and len(prev_lines) >= 2:
+            return True
+        return False
+
+    for line in raw_lines:
+        if is_new_record_start(line, cur):
+            blocks.append(cur)
+            cur = [line]
+        else:
+            cur.append(line)
+    if cur:
+        blocks.append(cur)
+
+    results: list[dict] = []
+    today_d = today_kst()
+    room_pattern = re.compile(r"(거방\s*1호점|거방\s*1|거방1|거방|거래방|소통방|2호점|거방2호점)")
+
+    for blk in blocks:
+        joined = " / ".join(blk)
+        # 제거용 클린 텍스트 추적
+        work = joined
+
+        # 2) 날짜 & 시간 추출
+        dt_date, date_tok = parse_korean_date_token(work, today_d)
+        if date_tok:
+            work = work.replace(date_tok, " ", 1)
+        dt_time = parse_korean_time_token(work) or time(0, 0)
+        work = re.sub(r"(오전|오후)?\s*\d{1,2}\s*[:시]\s*\d{1,2}(?:\s*[:분]\s*\d{1,2}초?)?", " ", work, count=1)
+
+        # 3) 방 이름 추출
+        room_found = ""
+        rm_m = room_pattern.search(joined)
+        if rm_m:
+            room_found = normalize_room_name(rm_m.group(1), known_rooms)
+            work = room_pattern.sub(" ", work, count=1)
+        if not room_found:
+            room_found = known_rooms[0] if known_rooms else "기타"
+
+        # 4) 조치 유형 & 경고 횟수 / 기간 추출
+        action_type = "경고"
+        warn_cnt = 1
+        action_detail = "1회"
+
+        if "내풀" in joined and ("추방" in joined or "강퇴" in joined):
+            action_type = "내풀"
+            warn_cnt = 0
+            action_detail = "추방 후 내풀"
+        elif "내풀" in joined:
+            action_type = "내풀"
+            warn_cnt = 0
+            action_detail = "즉시풀기" if "즉시" in joined else "영구"
+        elif "영구" in joined:
+            action_type = "강퇴"
+            warn_cnt = 0
+            action_detail = "영구"
+        elif "강퇴" in joined or "추방" in joined or "내보냈습니다" in joined:
+            action_type = "강퇴"
+            warn_cnt = 0
+            action_detail = "영구"
+        else:
+            wm = re.search(r"경고\s*(\d+)?\s*회?", joined)
+            if wm:
+                action_type = "경고"
+                warn_cnt = int(wm.group(1)) if wm.group(1) else 1
+                action_detail = f"{warn_cnt}회"
+
+        # 5) 사유 추출
+        reason = ""
+        rsn_m = re.search(r"(?:추방\s*사유|사유)\s*[:：\-]?\s*([^/\n]+(?:\s*/\s*[^/\n]+)?)", joined)
+        if rsn_m:
+            cand = rsn_m.group(1).strip()
+            # 사유 뒤에 붙은 날짜/시간/방 꼬리 제거
+            cand = re.sub(r"(20\d{2}|\d{2})[.\-/]\d{1,2}[.\-/]\d{1,2}.*$", "", cand).strip()
+            cand = re.sub(r"(?<!\d)\d{6}(?!\d).*$", "", cand).strip()
+            cand = room_pattern.sub("", cand).strip(" /:-")
+            reason = cand
+
+        if not reason:
+            # 슬래시 포맷에서 사유 후보 추출
+            parts = [p.strip() for p in joined.split("/") if p.strip()]
+            for p in reversed(parts):
+                p_clean = room_pattern.sub("", p).strip()
+                if not p_clean:
+                    continue
+                if re.search(r"^(@|-\s*닉)", p_clean):
+                    continue
+                if re.fullmatch(r"[\d.:\s시분초~\-]+", p_clean):
+                    continue
+                if p_clean in ("내풀", "강퇴", "추방", "영구", "경고", "경고1회", "경고2회"):
+                    continue
+                reason = p_clean
+                break
+
+        if not reason:
+            reason = "기타"
+
+        # 6) 대상자 닉네임 추출 (복수 @멘션 지원)
+        first_line = blk[0]
+        targets: list[str] = []
+
+        if "@" in first_line:
+            # @닉네임1 @닉네임2 형태 분리 (조치/사유 키워드 이전까지만)
+            header_cut = re.split(r"(?:경고\s*\d*\s*회?|강퇴|추방|영구|내풀|추방사유|사유\s*[:：\-])", first_line)[0]
+            mentions = [m.strip() for m in header_cut.split("@") if m.strip()]
+            if mentions:
+                targets = mentions
+        if not targets:
+            # '- 닉 : 가사문동주 경고1회'
+            nm_m = re.match(r"^[-•*]?\s*닉\s*[:：]\s*(.+)$", first_line)
+            base_line = nm_m.group(1).strip() if nm_m else first_line
+            # 슬래시 첫 조각이 닉네임인 경우 ('모기버섯/26.10.18/...' or '축하하는 라이언/추방사유:...')
+            if "/" in base_line and not base_line.startswith("20") and not re.match(r"^\d{2}[.\-/]", base_line):
+                cand_nick = base_line.split("/", 1)[0].strip()
+            else:
+                cand_nick = base_line
+            cand_nick = re.split(r"(?:경고\s*\d*\s*회?|강퇴|추방|영구|내풀|추방사유|사유\s*[:：\-])", cand_nick)[0]
+            cand_nick = room_pattern.sub("", cand_nick).lstrip("@").strip(" /:-")
+            if not cand_nick or re.fullmatch(r"[\d.:\s시분초/\-]+", cand_nick):
+                cand_nick = "미상대상자"
+            targets = [cand_nick]
+
+        for tg in targets:
+            results.append({
+                "선택": True,
+                "대상자": tg,
+                "조치일": dt_date,
+                "조치시간": dt_time.strftime("%H:%M"),
+                "방": room_found,
+                "조치유형": action_type,
+                "횟수_기간": action_detail,
+                "사유": reason,
+                "담당자": default_staff,
+            })
+
+    return results
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_vacation_rules(db_mode_key: str) -> list[dict]:
     conn = get_conn()
     rows = conn.execute("SELECT * FROM vacation_rule_items ORDER BY id ASC").fetchall()
-    conn.close()
+    _release_conn(conn)
     return [dict(r) for r in rows]
+
+
+def get_vacation_rules() -> list[dict]:
+    db_key = "pg" if is_postgres_configured() else "sq"
+    return _cached_vacation_rules(db_key)
 
 
 # ==========================================
@@ -866,7 +1209,7 @@ def log_activity(app_name: str, username: str, nickname: str, grade: str, action
         (app_name, username, nickname, grade, action, detail, now),
     )
     conn.commit()
-    conn.close()
+    _release_conn(conn)
 
 
 def register_user(username: str, password: str, nickname: str) -> tuple[bool, str]:
@@ -885,9 +1228,9 @@ def register_user(username: str, password: str, nickname: str) -> tuple[bool, st
         conn.commit()
     except Exception:
         conn.rollback()
-        conn.close()
+        _release_conn(conn)
         return False, "이미 사용 중인 아이디 또는 닉네임입니다."
-    conn.close()
+    _release_conn(conn)
     log_activity("auth", uname, nick, "-", "회원가입신청", "관리자 승인 대기")
     return True, "회원가입 신청이 완료되었습니다! 관리자(MS/MP) 승인 후 로그인할 수 있습니다."
 
@@ -897,16 +1240,16 @@ def authenticate_user(username: str, password: str) -> tuple[bool, str, dict | N
     conn = get_conn()
     row = conn.execute("SELECT * FROM users WHERE username = ?", (uname,)).fetchone()
     if not row or row["password_hash"] != hash_pw(password):
-        conn.close()
+        _release_conn(conn)
         return False, "아이디 또는 비밀번호가 올바르지 않습니다.", None
     if row["approval_status"] == "대기중":
-        conn.close()
+        _release_conn(conn)
         return False, "⏳ 관리자 승인 대기 중입니다.", None
     if row["approval_status"] == "거절됨":
-        conn.close()
+        _release_conn(conn)
         return False, "❌ 가입이 거절된 계정입니다.", None
     m = conn.execute("SELECT * FROM members WHERE nickname = ?", (row["nickname"],)).fetchone()
-    conn.close()
+    _release_conn(conn)
     if m and m["status"] == "해임":
         return False, "해임 처리된 계정입니다.", None
     return True, "로그인 성공", {
@@ -923,10 +1266,10 @@ def refresh_user_info(username: str) -> dict | None:
     conn = get_conn()
     row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if not row or row["approval_status"] != "승인완료":
-        conn.close()
+        _release_conn(conn)
         return None
     m = conn.execute("SELECT * FROM members WHERE nickname = ?", (row["nickname"],)).fetchone()
-    conn.close()
+    _release_conn(conn)
     if m and m["status"] == "해임":
         return None
     return {
@@ -943,8 +1286,12 @@ def render_auth_gate(site_title: str) -> dict:
     if "auth_user" not in st.session_state:
         st.session_state.auth_user = None
     if st.session_state.auth_user:
-        latest = refresh_user_info(st.session_state.auth_user["username"])
-        st.session_state.auth_user = latest
+        now_epoch = py_time.time()
+        last_auth_chk = st.session_state.get("_last_auth_refresh", 0.0)
+        if now_epoch - last_auth_chk > 30.0:
+            st.session_state["_last_auth_refresh"] = now_epoch
+            latest = refresh_user_info(st.session_state.auth_user["username"])
+            st.session_state.auth_user = latest
 
     if not st.session_state.auth_user:
         st.title(f"🔒 {site_title}")
@@ -992,12 +1339,18 @@ def render_auth_gate(site_title: str) -> dict:
     return user
 
 
-def get_members(only_active=False):
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_members(db_mode_key: str, only_active: bool) -> list[dict]:
     conn = get_conn()
     q = "SELECT * FROM members" + (" WHERE status = '활동중'" if only_active else "") + " ORDER BY points DESC, nickname ASC"
     rows = conn.execute(q).fetchall()
-    conn.close()
+    _release_conn(conn)
     return [dict(r) for r in rows]
+
+
+def get_members(only_active=False):
+    db_key = "pg" if is_postgres_configured() else "sq"
+    return _cached_members(db_key, bool(only_active))
 
 
 def record_performance(member_id: int, season: str, week: str, category: str, points: int, vacation_days: int, memo: str = ""):
@@ -1013,23 +1366,30 @@ def record_performance(member_id: int, season: str, week: str, category: str, po
         (member_id, season, week, category, points, vacation_days, memo, now),
     )
     conn.commit()
-    conn.close()
+    _release_conn(conn)
+    _clear_fast_caches()
     return f" 🎉 등급 변동: [{old_grade}] ➔ [{new_grade}]!" if new_grade != old_grade else ""
 
 
 def get_logs(limit=100):
     conn = get_conn()
     rows = conn.execute("SELECT l.*, m.nickname, m.grade FROM logs l JOIN members m ON l.member_id = m.id ORDER BY l.id DESC LIMIT ?", (limit,)).fetchall()
-    conn.close()
+    _release_conn(conn)
     return [dict(r) for r in rows]
 
 
-def get_tbl_settings(table_name: str) -> dict:
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_tbl_settings(db_mode_key: str, table_name: str) -> dict:
     conn = get_conn()
     rows = conn.execute(f"SELECT key, value FROM {table_name}").fetchall()
-    conn.close()
+    _release_conn(conn)
     s = {r["key"]: r["value"] for r in rows}
     return {"cutoff_weekday": int(s.get("cutoff_weekday", 2)), "cutoff_hour": int(s.get("cutoff_hour", 22)), "cutoff_minute": int(s.get("cutoff_minute", 0))}
+
+
+def get_tbl_settings(table_name: str) -> dict:
+    db_key = "pg" if is_postgres_configured() else "sq"
+    return _cached_tbl_settings(db_key, table_name)
 
 
 def save_tbl_setting(table_name: str, key: str, value: str):
@@ -1039,7 +1399,7 @@ def save_tbl_setting(table_name: str, key: str, value: str):
     else:
         conn.execute(f"INSERT INTO {table_name} (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
     conn.commit()
-    conn.close()
+    _release_conn(conn)
 
 
 def get_cutoff_date_str(dt: datetime, cw: int, ch: int, cm: int) -> str:
@@ -1058,7 +1418,7 @@ def recalculate_cutoffs(record_table: str, dt_col: str, cw: int, ch: int, cm: in
         nc = get_cutoff_date_str(datetime.strptime(r[dt_col], "%Y-%m-%d %H:%M"), cw, ch, cm)
         conn.execute(f"UPDATE {record_table} SET cutoff_date = ? WHERE id = ?", (nc, r["id"]))
     conn.commit()
-    conn.close()
+    _release_conn(conn)
 
 
 def parse_date_str(raw_date: str) -> date:
@@ -1178,7 +1538,7 @@ def check_and_send_naepul_timers():
         "SELECT id, target_name, room, action_type, action_detail, reason, timer_end_dt FROM mod_records WHERE timer_end_dt != '' AND timer_notified = 0 AND timer_end_dt <= ?",
         (now_str,),
     ).fetchall()
-    conn.close()
+    _release_conn(conn)
 
     notified_list = []
     for r in due_rows:
@@ -1188,7 +1548,7 @@ def check_and_send_naepul_timers():
             conn = get_conn()
             conn.execute("UPDATE mod_records SET timer_notified = 1 WHERE id = ?", (r["id"],))
             conn.commit()
-            conn.close()
+            _release_conn(conn)
             notified_list.append(r["target_name"])
     return notified_list
 
@@ -1234,21 +1594,25 @@ if "--watch-timers" in sys.argv:
             print(f"[{now_kst().strftime('%H:%M:%S')}] 결산 알림 발송 완료: {s_fired}")
         py_time.sleep(30)
 
-_auto_fired = check_and_send_naepul_timers()
-if _auto_fired:
-    st.toast(f"⏰ 내풀 타이머 만료 알림 발송: {', '.join(_auto_fired)}")
+_now_ts = py_time.time()
+if _now_ts - st.session_state.get("_last_bg_alert_chk", 0.0) >= 60.0:
+    st.session_state["_last_bg_alert_chk"] = _now_ts
+    _auto_fired = check_and_send_naepul_timers()
+    if _auto_fired:
+        st.toast(f"⏰ 내풀 타이머 만료 알림 발송: {', '.join(_auto_fired)}")
 
-_settle_fired = check_and_send_settlement_alert()
-if _settle_fired:
-    st.toast(f"📊 {_settle_fired} 발송 완료")
+    _settle_fired = check_and_send_settlement_alert()
+    if _settle_fired:
+        st.toast(f"📊 {_settle_fired} 발송 완료")
 
 SITE_TITLE = get_opt_str("site_title", "오픈채팅 부방 통합 관리")
 current_user = render_auth_gate(SITE_TITLE)
 is_mgr = is_manager_grade(current_user)
 
 MENU_TREE = [
-    ("🏆 순위 · 휴가 · 상점 · 알바", [
+    ("🏆 순위 · 달력 · 휴가 · 상점 · 알바", [
         ("rank", "순위 / 등급"),
+        ("calendar_view", "일정 · 휴가 · 마감 달력"),
         ("my_logs", "내 지급내역"),
         ("vacation", "정기휴가 신청"),
         ("shop", "포인트 상점"),
@@ -1318,15 +1682,22 @@ nav = st.session_state.nav_key
 # ==========================================
 # SECTION 1: 순위 · 휴가 · 상점 · 알바
 # ==========================================
-if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
+if nav in ("rank", "calendar_view", "my_logs", "vacation", "shop", "alba"):
     st.title(f"🏆 {SITE_TITLE}")
 
     if nav == "rank":
-        st.subheader("📊 순위 / 등급")
+        st.subheader("📊 순위 / 등급 & 승급 혜택")
         grades = get_grade_thresholds()
         carry_pct = get_opt_int("monthly_carryover_pct", 60)
         grade_info = " | ".join([f"**{g}**: {t}P↑" for t, g in grades])
-        st.info(f"🎖️ **승급 기준:** {grade_info} *(MP/MS 임명 전용)*\n\n💡 **월말 결산:** 포인트 리셋 & **{carry_pct}%** 휴가 이월")
+        st.info(
+            f"🎖️ **승급 기준:** {grade_info} *(MP/MS 임명 전용)*\n\n"
+            f"✨ **M1~M4 승급 혜택:**\n"
+            f"1️⃣ **월간 결산 시 수수료 절감 (등급당 5%씩):** M1(0%) · M2(**5%**) · M3(**10%**) · M4(**15%**) *(MS/MP 20%)*\n"
+            f"2️⃣ **상점 아이템 1일 선예매:** **M3 / M4** (및 MS/MP) 전용 선예매 기간 우선 구매 가능\n"
+            f"3️⃣ **알바 조건 우선권:** 상위 등급(M4→M3→M2→M1) 우선 예약 및 우대 적용\n\n"
+            f"💡 **월말 결산:** 포인트 리셋 & **{carry_pct}%** 휴가 이월 (+ 등급별 결산 수수료 절감 적용)"
+        )
         members = get_members()
         if members:
             st.dataframe(
@@ -1335,12 +1706,111 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                     "등급 & 닉네임": f"[{m.get('grade','M1')}] {m['nickname']}",
                     "직책": m["role"],
                     "포인트": f"{m['points']}P",
+                    "결산수수료절감": f"{get_grade_fee_discount_pct(m.get('grade','M1'))}%",
                     "잔여휴가": f"{m['vacation_days']}일",
                     "상태": m["status"],
                 } for idx, m in enumerate(members, 1)],
                 use_container_width=True,
                 hide_index=True,
             )
+
+    elif nav == "calendar_view":
+        st.subheader("📅 일정 · 휴가 · 주간 마감 달력")
+        td = today_kst()
+        c_y, c_m = st.columns(2)
+        sel_year = c_y.number_input("연도", min_value=2024, max_value=2035, value=td.year, step=1, key="cal_y")
+        sel_month = c_m.selectbox("월", list(range(1, 13)), index=td.month - 1, format_func=lambda x: f"{x}월", key="cal_m")
+
+        # 데이터 수집: 정기휴가 신청, 경고/강퇴 마감일, 보룸 마감일, 결산 요일
+        mod_cfg = get_tbl_settings("mod_settings")
+        vr_cfg = get_tbl_settings("voice_settings")
+        settle_wd = get_opt_int("settlement_weekday", 4)
+
+        conn = get_conn()
+        vac_rows = [dict(r) for r in conn.execute(
+            "SELECT v.*, m.nickname, m.grade FROM vacation_requests v JOIN members m ON v.member_id=m.id WHERE v.status != '거절됨' ORDER BY v.id DESC"
+        ).fetchall()]
+        mod_cuts = {r["cutoff_date"] for r in conn.execute("SELECT DISTINCT cutoff_date FROM mod_records").fetchall()}
+        vr_cuts = {r["cutoff_date"] for r in conn.execute("SELECT DISTINCT cutoff_date FROM voice_records").fetchall()}
+        _release_conn(conn)
+
+        # 날짜별 이벤트 맵 구성 (YYYY-MM-DD -> list[str])
+        events_by_day: dict[str, list[str]] = {}
+        cal_matrix = calendar.monthcalendar(int(sel_year), int(sel_month))
+
+        for week in cal_matrix:
+            for d_num in week:
+                if d_num == 0:
+                    continue
+                d_obj = date(int(sel_year), int(sel_month), d_num)
+                d_str = d_obj.strftime("%Y-%m-%d")
+                evs = []
+                if d_obj.weekday() == mod_cfg["cutoff_weekday"] or d_str in mod_cuts:
+                    evs.append("🛡️ 경고/내풀 마감")
+                if d_obj.weekday() == vr_cfg["cutoff_weekday"] or d_str in vr_cuts:
+                    evs.append("🎙️ 보룸 마감")
+                if d_obj.weekday() == settle_wd:
+                    evs.append("📊 주간 결산")
+                if d_num == calendar.monthrange(int(sel_year), int(sel_month))[1]:
+                    evs.append("🔄 월말 결산 예정")
+                if sel_month == 12 and d_num == 3:
+                    evs.append("📝 기말고사 휴가 마감")
+                if evs:
+                    events_by_day[d_str] = evs
+
+        # 휴가 신청일 기반 표시 (created_at 날짜부터 requested_days 만큼 표시)
+        for v in vac_rows:
+            try:
+                start_d = datetime.strptime(str(v["created_at"])[:10], "%Y-%m-%d").date()
+                span = max(1, int(v.get("requested_days") or 1))
+                for offset in range(span):
+                    cur_d = start_d + timedelta(days=offset)
+                    if cur_d.year == int(sel_year) and cur_d.month == int(sel_month):
+                        ds = cur_d.strftime("%Y-%m-%d")
+                        tag = "✅" if v["status"] == "승인완료" else "⏳"
+                        events_by_day.setdefault(ds, []).append(f"{tag} 휴가: {v['nickname']} ({v['category']})")
+            except Exception:
+                pass
+
+        # HTML 달력 렌더링
+        st.caption("🛡️ 경고/내풀 마감 | 🎙️ 보룸 마감 | 📊 주간 결산 | ✅ 승인휴가 | ⏳ 대기휴가")
+        html_rows = ['<table style="width:100%; border-collapse:collapse; table-layout:fixed; font-size:0.84rem;">']
+        html_rows.append("<thead><tr>")
+        for idx_w, w_lbl in enumerate(["월", "화", "수", "목", "금", "토", "일"]):
+            color = "#ef4444" if idx_w == 6 else ("#3b82f6" if idx_w == 5 else "inherit")
+            html_rows.append(f'<th style="border:1px solid rgba(128,128,128,0.3); padding:6px; text-align:center; color:{color};">{w_lbl}</th>')
+        html_rows.append("</tr></thead><tbody>")
+
+        for week in cal_matrix:
+            html_rows.append("<tr>")
+            for idx_w, d_num in enumerate(week):
+                if d_num == 0:
+                    html_rows.append('<td style="border:1px solid rgba(128,128,128,0.2); height:84px; background:rgba(128,128,128,0.04);"></td>')
+                else:
+                    d_obj = date(int(sel_year), int(sel_month), d_num)
+                    d_str = d_obj.strftime("%Y-%m-%d")
+                    is_today = (d_obj == td)
+                    bg = "rgba(59,130,246,0.14)" if is_today else "transparent"
+                    day_color = "#ef4444" if idx_w == 6 else ("#3b82f6" if idx_w == 5 else "inherit")
+                    evs = events_by_day.get(d_str, [])
+                    ev_html = "".join([f'<div style="font-size:0.74rem; line-height:1.25; margin-top:2px; padding:1px 3px; border-radius:4px; background:rgba(128,128,128,0.12); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{e}</div>' for e in evs[:4]])
+                    if len(evs) > 4:
+                        ev_html += f'<div style="font-size:0.7rem; opacity:0.75;">+{len(evs)-4}건 더보기</div>'
+                    html_rows.append(
+                        f'<td style="border:1px solid rgba(128,128,128,0.25); height:88px; vertical-align:top; padding:4px; background:{bg};">'
+                        f'<div style="font-weight:700; color:{day_color};">{d_num}{" (오늘)" if is_today else ""}</div>{ev_html}</td>'
+                    )
+            html_rows.append("</tr>")
+        html_rows.append("</tbody></table>")
+        st.markdown("".join(html_rows), unsafe_allow_html=True)
+
+        st.divider()
+        st.markdown(f"### 📋 {int(sel_year)}년 {int(sel_month)}월 주요 일정 상세")
+        if not events_by_day:
+            st.info("표시할 일정이 없습니다.")
+        else:
+            for d_key in sorted(events_by_day.keys()):
+                st.markdown(f"- **{d_key}**: " + " / ".join(events_by_day[d_key]))
 
     elif nav == "my_logs":
         st.subheader("📋 내 지급내역")
@@ -1407,7 +1877,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                     ).fetchone()
                     cnt = cnt_row["cnt"] if isinstance(cnt_row, dict) else cnt_row[0]
                     if cnt >= lim:
-                        conn.close()
+                        _release_conn(conn)
                         st.error(f"이번 달 최대 신청 횟수({lim}회)를 초과했습니다!")
                         st.stop()
                 conn.execute(
@@ -1415,34 +1885,57 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                     (sel_m_id, sel_cat, req_days, pm, pi, cm, now),
                 )
                 conn.commit()
-                conn.close()
+                _release_conn(conn)
                 log_activity("kakao_user_app", current_user["username"], current_user["nickname"], current_user["grade"], "정기휴가신청", f"{sel_cat} ({req_days}일)")
                 st.success(f"'{sel_cat}' ({req_days}일) 신청 완료!")
 
     elif nav == "shop":
-        st.subheader("🎁 포인트 상점")
+        st.subheader("🎁 포인트 상점 (M3/M4 1일 선예매 혜택 적용)")
+        st.caption("✨ 선예매 설정이 켜진 신상품은 등록 후 **1일(24시간) 동안 M3 · M4 (및 MS/MP)** 등급이 먼저 교환할 수 있습니다.")
         members = get_members(only_active=True)
         conn = get_conn()
         items = [dict(r) for r in conn.execute("SELECT * FROM shop_items ORDER BY price ASC").fetchall()]
-        conn.close()
+        _release_conn(conn)
         if members and items:
             b_opts = {f"[{m.get('grade','M1')}] {m['nickname']} ({m['points']}P)": m["id"] for m in members}
             def_b = next((k for k in b_opts if current_user["nickname"] in k), list(b_opts.keys())[0])
             bid = b_opts[st.selectbox("구매자 선택", list(b_opts.keys()), index=list(b_opts.keys()).index(def_b), key="shop_u")]
+            buyer_obj = next((m for m in members if m["id"] == bid), None)
+            buyer_grade = (buyer_obj.get("grade") if buyer_obj else current_user.get("grade")) or "M1"
+            now_shop_dt = now_kst()
+
             for item in items:
+                ea_days = int(item.get("early_access_days") or 0)
+                rel_str = str(item.get("released_at") or "").strip()
+                in_early_window = False
+                ea_end_str = ""
+                if ea_days > 0 and rel_str:
+                    try:
+                        rel_dt = datetime.strptime(rel_str, "%Y-%m-%d %H:%M:%S")
+                        ea_end_dt = rel_dt + timedelta(days=ea_days)
+                        if now_shop_dt < ea_end_dt:
+                            in_early_window = True
+                            ea_end_str = ea_end_dt.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        pass
+
+                locked_by_grade = in_early_window and (not is_early_access_eligible(buyer_grade))
                 with st.container(border=True):
-                    st.markdown(f"**{item['item_name']}** — `{item['price']}P` (재고 {item['stock']}개)")
+                    badge = f" 🌟 **[M3/M4 {ea_days}일 선예매 중 ~ {ea_end_str}]**" if in_early_window else ""
+                    st.markdown(f"**{item['item_name']}** — `{item['price']}P` (재고 {item['stock']}개){badge}")
                     if item["description"]:
                         st.caption(item["description"])
-                    if st.button("🎁 교환 신청", key=f"buy_{item['id']}", use_container_width=True):
+                    if locked_by_grade:
+                        st.warning(f"🔒 현재 **M3 / M4 선예매 기간**입니다. 일반 등급({buyer_grade})은 `{ea_end_str}` 이후 구매할 수 있습니다.")
+                    if st.button("🎁 교환 신청", key=f"buy_{item['id']}", disabled=locked_by_grade, use_container_width=True):
                         conn = get_conn()
                         m = conn.execute("SELECT * FROM members WHERE id=?", (bid,)).fetchone()
                         it = conn.execute("SELECT * FROM shop_items WHERE id=?", (item["id"],)).fetchone()
                         if m["points"] < it["price"]:
-                            conn.close()
+                            _release_conn(conn)
                             st.error("포인트가 부족합니다!")
                         elif it["stock"] <= 0:
-                            conn.close()
+                            _release_conn(conn)
                             st.error("재고가 소진되었습니다.")
                         else:
                             now = now_kst().strftime("%Y-%m-%d %H:%M:%S")
@@ -1453,7 +1946,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                             conn.execute("INSERT INTO shop_orders (member_id, item_name, price, status, created_at) VALUES (?,?,?,'대기중',?)", (bid, it["item_name"], it["price"], now))
                             conn.execute("INSERT INTO logs (member_id, season, week, log_type, category, minutes, points_delta, vacation_delta, memo, created_at) VALUES (?,'시즌통합','상점주차','상점구매','포인트상점',0,?,0,?,?)", (bid, -it["price"], f"상품 교환: {it['item_name']}", now))
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             log_activity("kakao_user_app", current_user["username"], current_user["nickname"], current_user["grade"], "상점교환", f"{it['item_name']} ({it['price']}P)")
                             st.success(f"'{it['item_name']}' 교환 완료!")
                             st.rerun()
@@ -1462,7 +1955,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
 
     elif nav == "alba":
         st.subheader("💼 알바 게시판 (예약 · 사진/링크 인증 · 승인 지급)")
-        st.caption("관리자가 걸어둔 포인트를 확인하고 예약한 뒤, 사진 또는 링크를 올려 인증하면 관리자 승인 후 포인트가 지급됩니다.")
+        st.caption("관리자가 걸어둔 포인트를 확인하고 예약한 뒤, 사진 또는 링크를 올려 인증하면 관리자 승인 후 포인트가 지급됩니다. (✨ M1~M4 승급 혜택: 상위 등급 알바 조건 우선권)")
 
         if is_mgr:
             with st.expander("➕ 새 알바 공고 등록 (MS/MP)", expanded=False):
@@ -1481,7 +1974,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                                 (a_title.strip(), a_desc.strip(), int(a_pts), current_user["nickname"], now),
                             )
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             log_activity("alba", current_user["username"], current_user["nickname"], current_user["grade"], "알바등록", f"{a_title.strip()} ({int(a_pts)}P)")
                             send_phone_push("💼 새 알바 등록", f"[{a_title.strip()}] 보상: {int(a_pts)}P\n등록자: {current_user['nickname']}")
                             st.success("알바 공고가 등록되었습니다!")
@@ -1489,7 +1982,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
 
         conn = get_conn()
         jobs = [dict(r) for r in conn.execute("SELECT * FROM alba_jobs ORDER BY id DESC").fetchall()]
-        conn.close()
+        _release_conn(conn)
 
         if not jobs:
             st.info("현재 등록된 알바가 없습니다.")
@@ -1525,7 +2018,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                                 (current_user["nickname"], now, jid),
                             )
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             log_activity("alba", current_user["username"], current_user["nickname"], current_user["grade"], "알바예약", f"#{jid} {job['title']}")
                             send_phone_push("🙋 알바 예약 완료", f"알바: {job['title']} ({job['reward_points']}P)\n예약자: {current_user['nickname']}")
                             st.success("예약되었습니다! 완료 후 사진이나 링크를 올려 인증해 주세요.")
@@ -1550,7 +2043,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                                             (p_url.strip(), img_val, p_memo.strip(), now, jid),
                                         )
                                         conn.commit()
-                                        conn.close()
+                                        _release_conn(conn)
                                         log_activity("alba", current_user["username"], current_user["nickname"], current_user["grade"], "알바인증제출", f"#{jid} {job['title']}")
                                         send_phone_push("📤 알바 인증 제출", f"알바: {job['title']} ({job['reward_points']}P)\n제출자: {booked_by or current_user['nickname']}")
                                         st.success("인증이 제출되었습니다! 관리자 승인을 기다려 주세요.")
@@ -1560,7 +2053,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                                 conn = get_conn()
                                 conn.execute("UPDATE alba_jobs SET status='모집중', booked_by='', booked_at='' WHERE id=?", (jid,))
                                 conn.commit()
-                                conn.close()
+                                _release_conn(conn)
                                 st.rerun()
 
                     elif status == "인증제출" and is_mgr:
@@ -1574,7 +2067,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                                 (current_user["nickname"], now, jid),
                             )
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             if mem:
                                 td = today_kst()
                                 record_performance(
@@ -1599,7 +2092,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                                 (current_user["nickname"], now, jid),
                             )
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             st.rerun()
 
                     if is_mgr:
@@ -1607,7 +2100,7 @@ if nav in ("rank", "my_logs", "vacation", "shop", "alba"):
                             conn = get_conn()
                             conn.execute("DELETE FROM alba_jobs WHERE id=?", (jid,))
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             st.rerun()
 
 
@@ -1625,7 +2118,7 @@ elif nav in ("site_chat", "suggestions", "ntfy_box"):
 
         conn = get_conn()
         msgs = [dict(r) for r in conn.execute("SELECT * FROM site_chat_messages ORDER BY id DESC LIMIT 80").fetchall()]
-        conn.close()
+        _release_conn(conn)
 
         msgs.reverse()
         with st.container(border=True):
@@ -1649,7 +2142,7 @@ elif nav in ("site_chat", "suggestions", "ntfy_box"):
                         (current_user["username"], current_user["nickname"], current_user["grade"], chat_txt.strip(), now),
                     )
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     st.rerun()
 
         if is_mgr and msgs:
@@ -1658,7 +2151,7 @@ elif nav in ("site_chat", "suggestions", "ntfy_box"):
                     conn = get_conn()
                     conn.execute("DELETE FROM site_chat_messages")
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     st.rerun()
 
     elif nav == "suggestions":
@@ -1679,7 +2172,7 @@ elif nav in ("site_chat", "suggestions", "ntfy_box"):
                         (current_user["username"], current_user["nickname"], current_user["grade"], s_cat, s_title.strip(), s_content.strip(), now, now),
                     )
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     log_activity("suggestions", current_user["username"], current_user["nickname"], current_user["grade"], "건의등록", f"[{s_cat}] {s_title.strip()}")
                     if send_push_chk:
                         send_phone_push("📬 새 건의 접수", f"[{s_cat}] {s_title.strip()}\n작성자: {current_user['nickname']}")
@@ -1690,7 +2183,7 @@ elif nav in ("site_chat", "suggestions", "ntfy_box"):
         st.markdown("### 📋 접수된 건의 목록")
         conn = get_conn()
         s_rows = [dict(r) for r in conn.execute("SELECT * FROM suggestion_box ORDER BY id DESC").fetchall()]
-        conn.close()
+        _release_conn(conn)
 
         if not s_rows:
             st.info("등록된 건의가 없습니다.")
@@ -1717,13 +2210,13 @@ elif nav in ("site_chat", "suggestions", "ntfy_box"):
                                 (new_st, new_rep.strip(), current_user["nickname"], now, item["id"]),
                             )
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             st.rerun()
                         if b2.button("🗑️ 삭제", key=f"sug_del_{item['id']}", use_container_width=True):
                             conn = get_conn()
                             conn.execute("DELETE FROM suggestion_box WHERE id=?", (item["id"],))
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             st.rerun()
 
     elif nav == "ntfy_box":
@@ -1921,54 +2414,100 @@ elif nav in ("mod_input", "mod_score", "mod_search", "mod_timer", "mod_audit"):
                             (t_name.lstrip("@").strip(), a_date.strftime("%Y-%m-%d"), a_time.strftime("%H:%M"), dt_obj.strftime("%Y-%m-%d %H:%M"), c_str, room, a_type, int(warn_cnt), a_detail, fr, rec_staff, rev_statuses[0], note_in.strip(), ev_b64, timer_end_str, 0, cur_kst.strftime("%Y-%m-%d %H:%M:%S")),
                         )
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         log_activity("kakao_control_manager", current_user["username"], current_user["nickname"], current_user["grade"], "경고강퇴등록", f"{t_name} ({a_type} {a_detail} / {room} / {fr})")
                         st.success(f"저장 완료! ({a_type} {a_detail} | {c_str})")
                         st.rerun()
 
-        with st.expander("2️⃣ 카톡 양식 붙여넣기 (일괄 등록)"):
-            b_txt = st.text_area("카톡 내용 붙여넣기", height=180, placeholder="FC야구찐팬/26.09.28/23:49/거래방/내풀")
-            if st.button("⚡ 자동 분석 후 일괄 저장", use_container_width=True):
-                lines = [l.strip() for l in b_txt.splitlines() if l.strip()]
-                items, errs, i = [], [], 0
-                now_str_batch = now_kst().strftime("%Y-%m-%d %H:%M:%S")
-                while i < len(lines):
-                    line = lines[i]
-                    if line.count("/") >= 4:
-                        nm, ds, ts, rm, rsn = [p.strip() for p in line.split("/", 4)]
-                        try:
-                            dt_obj = datetime.combine(parse_date_str(ds), parse_time_str(ts))
-                            atype = "내풀" if "내풀" in rsn else ("강퇴" if "강퇴" in rsn else "경고")
-                            items.append((nm.lstrip("@").strip(), dt_obj.strftime("%Y-%m-%d"), dt_obj.strftime("%H:%M"), dt_obj.strftime("%Y-%m-%d %H:%M"), get_cutoff_date_str(dt_obj, cfg["cutoff_weekday"], cfg["cutoff_hour"], cfg["cutoff_minute"]), rm, atype, rsn, rec_staff, rev_statuses[0], "", now_str_batch))
-                        except Exception as e:
-                            errs.append(f"'{line}': {e}")
-                        i += 1
-                        continue
-                    if i + 2 < len(lines) and lines[i + 2].count("/") == 2:
-                        try:
-                            ch = lines[i].lstrip("@").strip()
-                            m_h = re.match(r"^(\S+)\s*(.*)$", ch)
-                            nm = m_h.group(1) if m_h else ch
-                            atype = m_h.group(2).strip() if (m_h and m_h.group(2).strip()) else "경고"
-                            rsn = re.sub(r"^사유\s*[:：]?\s*", "", lines[i + 1]).strip()
-                            ds, ts, rm = [p.strip() for p in lines[i + 2].split("/", 2)]
-                            dt_obj = datetime.combine(parse_date_str(ds), parse_time_str(ts))
-                            items.append((nm, dt_obj.strftime("%Y-%m-%d"), dt_obj.strftime("%H:%M"), dt_obj.strftime("%Y-%m-%d %H:%M"), get_cutoff_date_str(dt_obj, cfg["cutoff_weekday"], cfg["cutoff_hour"], cfg["cutoff_minute"]), rm, atype, rsn, rec_staff, rev_statuses[0], "", now_str_batch))
-                            i += 3
+        with st.expander("2️⃣ 카톡 양식 붙여넣기 (자유 양식 자동 분석 · 미리보기 수정 후 저장)", expanded=True):
+            st.caption("한 줄형(`닉/날짜/시간/방/사유`), 여러 줄 블록형(`@닉 경고 2회` + `사유: ...` + `26.11.06/6:47/거방1`), 복수 `@멘션` 등 제각각인 카톡 복붙 양식을 자동 분류합니다.")
+            b_txt = st.text_area(
+                "카톡 내용 붙여넣기",
+                height=190,
+                placeholder="@LG❤️  경고 2회\n사유 가격 미기재\n26.11.06 /6:47 /거방 1\n\n@1등 포기한 스카피 강퇴\n사유: 카프",
+                key="mod_paste_raw",
+            )
+            if st.button("🔍 자동 분석 및 미리보기 생성", use_container_width=True, key="btn_parse_preview"):
+                parsed_rows = smart_parse_mod_paste(b_txt, c_rooms, rec_staff)
+                if not parsed_rows:
+                    st.warning("분석할 수 있는 텍스트가 없습니다. 내용을 확인해 주세요.")
+                else:
+                    st.session_state["mod_parsed_preview"] = pd.DataFrame(parsed_rows)
+
+            if "mod_parsed_preview" in st.session_state and not st.session_state["mod_parsed_preview"].empty:
+                st.markdown("#### 📋 분석 결과 미리보기 (셀을 클릭해 직접 수정 후 저장하세요)")
+                edited_df = st.data_editor(
+                    st.session_state["mod_parsed_preview"],
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="dynamic",
+                    column_config={
+                        "선택": st.column_config.CheckboxColumn("저장", default=True),
+                        "조치일": st.column_config.DateColumn("조치일", format="YYYY-MM-DD"),
+                        "방": st.column_config.SelectboxColumn("방", options=c_rooms, required=False),
+                        "조치유형": st.column_config.SelectboxColumn("조치유형", options=c_types, required=False),
+                    },
+                    key="mod_preview_editor",
+                )
+                c_sv1, c_sv2 = st.columns(2)
+                if c_sv1.button("💾 선택한 항목 일괄 저장", type="primary", use_container_width=True, key="btn_save_parsed"):
+                    now_str_batch = now_kst().strftime("%Y-%m-%d %H:%M:%S")
+                    to_insert = []
+                    for _, r in edited_df.iterrows():
+                        if not bool(r.get("선택", True)):
                             continue
-                        except Exception as e:
-                            errs.append(f"'{lines[i]}': {e}")
-                            i += 1
+                        tg = str(r.get("대상자") or "").lstrip("@").strip()
+                        if not tg:
                             continue
-                    errs.append(f"건너뜀: '{line}'")
-                    i += 1
-                if items:
-                    conn = get_conn()
-                    conn.executemany("INSERT INTO mod_records (target_name, action_date, action_time, action_dt, cutoff_date, room, action_type, reason, staff_name, review_status, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", items)
-                    conn.commit()
-                    conn.close()
-                    log_activity("kakao_control_manager", current_user["username"], current_user["nickname"], current_user["grade"], "경고강퇴일괄등록", f"{len(items)}건")
-                    st.success(f"총 {len(items)}건 저장 완료!")
+                        d_val = r.get("조치일")
+                        if isinstance(d_val, datetime):
+                            d_obj = d_val.date()
+                        elif isinstance(d_val, date):
+                            d_obj = d_val
+                        else:
+                            d_obj = parse_date_str(str(d_val))
+                        t_obj = parse_time_str(str(r.get("조치시간") or "00:00"))
+                        dt_obj = datetime.combine(d_obj, t_obj)
+                        rm = str(r.get("방") or (c_rooms[0] if c_rooms else "기타")).strip()
+                        atype = str(r.get("조치유형") or "경고").strip()
+                        adetail = str(r.get("횟수_기간") or "").strip()
+                        rsn = str(r.get("사유") or "기타").strip()
+                        stf = str(r.get("담당자") or rec_staff).strip()
+                        w_m = re.search(r"(\d+)", adetail) if "경고" in atype else None
+                        w_cnt = int(w_m.group(1)) if w_m else (1 if "경고" in atype else 0)
+                        c_str = get_cutoff_date_str(dt_obj, cfg["cutoff_weekday"], cfg["cutoff_hour"], cfg["cutoff_minute"])
+                        to_insert.append((
+                            tg,
+                            d_obj.strftime("%Y-%m-%d"),
+                            t_obj.strftime("%H:%M"),
+                            dt_obj.strftime("%Y-%m-%d %H:%M"),
+                            c_str,
+                            rm,
+                            atype,
+                            w_cnt,
+                            adetail,
+                            rsn,
+                            stf,
+                            rev_statuses[0],
+                            "",
+                            now_str_batch,
+                        ))
+                    if to_insert:
+                        conn = get_conn()
+                        conn.executemany(
+                            "INSERT INTO mod_records (target_name, action_date, action_time, action_dt, cutoff_date, room, action_type, warning_count, action_detail, reason, staff_name, review_status, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            to_insert,
+                        )
+                        conn.commit()
+                        _release_conn(conn)
+                        log_activity("kakao_control_manager", current_user["username"], current_user["nickname"], current_user["grade"], "경고강퇴일괄등록", f"{len(to_insert)}건 (자유양식파서)")
+                        del st.session_state["mod_parsed_preview"]
+                        st.success(f"총 {len(to_insert)}건 저장 완료!")
+                        st.rerun()
+                    else:
+                        st.warning("저장할 선택된 행이 없습니다.")
+                if c_sv2.button("🗑️ 미리보기 비우기", use_container_width=True, key="btn_clear_parsed"):
+                    del st.session_state["mod_parsed_preview"]
                     st.rerun()
 
     elif nav == "mod_score":
@@ -2000,7 +2539,7 @@ elif nav in ("mod_input", "mod_score", "mod_search", "mod_timer", "mod_audit"):
                         conn = get_conn()
                         ex = conn.execute("SELECT status FROM mod_score_sync_log WHERE week_cutoff=? AND staff_name=?", (sel_w, r["부방"])).fetchone()
                         mem = conn.execute("SELECT id FROM members WHERE nickname=?", (r["부방"],)).fetchone()
-                        conn.close()
+                        _release_conn(conn)
                         if (ex and ex["status"] == "SUCCESS") or not mem:
                             continue
                         record_performance(mem["id"], s_in.strip() or "시즌통합", f"{sel_w} 마감", "경고/강퇴 주간실적", int(r["점수"]), 0, f"유효 조치 {int(r['건수'])}건 ({r['상태']})")
@@ -2016,7 +2555,7 @@ elif nav in ("mod_input", "mod_score", "mod_search", "mod_timer", "mod_audit"):
                                 (sel_w, r["부방"], mem["id"], int(r["건수"]), int(r["점수"]), now_kst().strftime("%Y-%m-%d %H:%M:%S")),
                             )
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         ok_c += 1
                     st.success(f"{ok_c}명 반영 완료!")
 
@@ -2054,13 +2593,13 @@ elif nav in ("mod_input", "mod_score", "mod_search", "mod_timer", "mod_audit"):
                     conn = get_conn()
                     conn.execute("UPDATE mod_records SET warning_count=?, action_detail=?, is_valid_score=?, review_status=?, note=? WHERE id=?", (int(new_wc), new_ad, int(nv), ns, nn, int(sid)))
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     st.rerun()
                 if c2.button("🗑️ 삭제", use_container_width=True):
                     conn = get_conn()
                     conn.execute("DELETE FROM mod_records WHERE id=?", (int(sid),))
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     st.rerun()
         else:
             st.info("기록이 없습니다.")
@@ -2201,7 +2740,7 @@ elif nav in ("vr_input", "vr_score", "vr_history"):
                         conn = get_conn()
                         conn.execute("INSERT INTO voice_records (staff_name, room, start_date, end_date, end_time, end_dt, cutoff_date, duration_str, duration_seconds, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rec_staff, frm, sd.strftime("%Y-%m-%d"), ed.strftime("%Y-%m-%d"), et.strftime("%H:%M"), edt.strftime("%Y-%m-%d %H:%M"), c_str, nd, ds, note_in.strip(), now_kst().strftime("%Y-%m-%d %H:%M:%S")))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         log_activity("kakao_voiceroom_manager", current_user["username"], current_user["nickname"], current_user["grade"], "보룸기록등록", f"{frm} ({nd})")
                         st.success(f"저장 완료! ({nd})")
                         st.rerun()
@@ -2256,7 +2795,7 @@ elif nav in ("vr_input", "vr_score", "vr_history"):
                     conn = get_conn()
                     conn.executemany("INSERT INTO voice_records (staff_name, room, start_date, end_date, end_time, end_dt, cutoff_date, duration_str, duration_seconds, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", items)
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     log_activity("kakao_voiceroom_manager", current_user["username"], current_user["nickname"], current_user["grade"], "보룸일괄등록", f"{len(items)}건")
                     st.success(f"총 {len(items)}건 저장 완료!")
                     st.rerun()
@@ -2294,7 +2833,7 @@ elif nav in ("vr_input", "vr_score", "vr_history"):
                         conn = get_conn()
                         ex = conn.execute("SELECT status FROM voice_score_sync_log WHERE week_cutoff=? AND staff_name=?", (sel_w, r["부방"])).fetchone()
                         mem = conn.execute("SELECT id FROM members WHERE nickname=?", (r["부방"],)).fetchone()
-                        conn.close()
+                        _release_conn(conn)
                         if (ex and ex["status"] == "SUCCESS") or not mem:
                             continue
                         record_performance(mem["id"], s_in.strip() or "시즌통합", f"{sel_w} 마감", "보이스룸 주간실적", int(r["점수"]), 0, f"보룸 누적 {r['누적 시간']} ({r['상태']})")
@@ -2310,7 +2849,7 @@ elif nav in ("vr_input", "vr_score", "vr_history"):
                                 (sel_w, r["부방"], mem["id"], int(r["_sec"]), int(r["점수"]), now_kst().strftime("%Y-%m-%d %H:%M:%S")),
                             )
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         ok_c += 1
                     st.success(f"{ok_c}명 반영 완료!")
 
@@ -2336,13 +2875,13 @@ elif nav in ("vr_input", "vr_score", "vr_history"):
                     conn = get_conn()
                     conn.execute("UPDATE voice_records SET is_valid_score=?, note=? WHERE id=?", (int(vc), ne, int(sid)))
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     st.rerun()
                 if c2.button("🗑️ 삭제", use_container_width=True):
                     conn = get_conn()
                     conn.execute("DELETE FROM voice_records WHERE id=?", (int(sid),))
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     st.rerun()
             st.download_button("📊 CSV 다운로드", df_all.to_csv(index=False).encode("utf-8-sig"), f"보이스룸_{today_kst().strftime('%Y%m%d')}.csv", "text/csv", use_container_width=True)
         else:
@@ -2365,7 +2904,7 @@ elif nav.startswith("adm_") and is_mgr:
             if sf != "전체":
                 q += f" WHERE u.approval_status='{sf}'"
             ul = [dict(r) for r in conn.execute(q + " ORDER BY u.id DESC").fetchall()]
-            conn.close()
+            _release_conn(conn)
             for u in ul:
                 with st.container(border=True):
                     st.markdown(f"**{u['nickname']}** (`@{u['username']}`) — 상태: **{u['approval_status']}**")
@@ -2379,13 +2918,13 @@ elif nav.startswith("adm_") and is_mgr:
                             if not conn.execute("SELECT id FROM members WHERE nickname=?", (u["nickname"],)).fetchone():
                                 conn.execute("INSERT INTO members (nickname, role, grade, points, vacation_days, status, joined_at) VALUES (?,'부방','M1',0,0,'활동중',?)", (u["nickname"], now))
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             st.rerun()
                         if b2.button("❌ 거절", key=f"ur_{u['id']}", disabled=(u["approval_status"] == "거절됨"), use_container_width=True):
                             conn = get_conn()
                             conn.execute("UPDATE users SET approval_status='거절됨' WHERE id=?", (u["id"],))
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             st.rerun()
         with tm:
             with st.form("adm_add_m"):
@@ -2397,7 +2936,7 @@ elif nav.startswith("adm_") and is_mgr:
                         conn = get_conn()
                         conn.execute("INSERT INTO members (nickname, role, grade, points, vacation_days, status, joined_at) VALUES (?,?,?,0,0,'활동중',?)", (nn.strip(), rr, gg, now_kst().strftime("%Y-%m-%d %H:%M:%S")))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.success("등록 완료")
                         st.rerun()
                     except Exception:
@@ -2412,13 +2951,13 @@ elif nav.startswith("adm_") and is_mgr:
                         conn = get_conn()
                         conn.execute("UPDATE members SET grade=? WHERE id=?", (ng, m["id"]))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.rerun()
                     if ns != m["status"]:
                         conn = get_conn()
                         conn.execute("UPDATE members SET status=? WHERE id=?", (ns, m["id"]))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.rerun()
                     if st.button("🗑️ 완전 삭제", key=f"dm_{m['id']}", use_container_width=True):
                         conn = get_conn()
@@ -2428,7 +2967,7 @@ elif nav.startswith("adm_") and is_mgr:
                         conn.execute("DELETE FROM users WHERE nickname=?", (m["nickname"],))
                         conn.execute("DELETE FROM members WHERE id=?", (m["id"],))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.rerun()
 
     elif nav == "adm_opts":
@@ -2481,7 +3020,7 @@ elif nav.startswith("adm_") and is_mgr:
         with tv1:
             conn = get_conn()
             reqs = [dict(r) for r in conn.execute("SELECT v.*, m.nickname, m.grade FROM vacation_requests v JOIN members m ON v.member_id=m.id ORDER BY v.id DESC").fetchall()]
-            conn.close()
+            _release_conn(conn)
             for r in reqs:
                 with st.container(border=True):
                     st.markdown(f"**[{r.get('grade','M1')}] {r['nickname']}** — `{r['category']}` ({r['requested_days']}일) | 상태: **{r['status']}**")
@@ -2498,13 +3037,13 @@ elif nav.startswith("adm_") and is_mgr:
                             conn.execute("UPDATE members SET vacation_days=vacation_days+? WHERE id=?", (cd, r["member_id"]))
                             conn.execute("INSERT INTO logs (member_id, season, week, log_type, category, minutes, points_delta, vacation_delta, memo, created_at) VALUES (?,'시즌통합','휴가승인주차','정기휴가승인',?,0,0,?,?,?)", (r["member_id"], r["category"], cd, f"정기휴가 승인 ({r['proof_memo']})", now))
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             st.rerun()
                         if b2.button("❌ 거절", key=f"ar_{r['id']}", use_container_width=True):
                             conn = get_conn()
                             conn.execute("UPDATE vacation_requests SET status='거절됨' WHERE id=?", (r["id"],))
                             conn.commit()
-                            conn.close()
+                            _release_conn(conn)
                             st.rerun()
         with tv2:
             with st.form("add_vac_rule"):
@@ -2519,7 +3058,7 @@ elif nav.startswith("adm_") and is_mgr:
                         conn = get_conn()
                         conn.execute("INSERT INTO vacation_rule_items (name, days, monthly_limit, is_discretionary, guide) VALUES (?,?,?,?,?)", (rn.strip(), rd, None if rl == 0 else rl, int(rdisc), rg))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.success("추가 완료!")
                         st.rerun()
                     except Exception:
@@ -2537,14 +3076,14 @@ elif nav.startswith("adm_") and is_mgr:
                         conn = get_conn()
                         conn.execute("UPDATE vacation_rule_items SET days=?, monthly_limit=?, is_discretionary=?, guide=? WHERE id=?", (ed_d, None if ed_l == 0 else ed_l, int(ed_disc), ed_g, vr["id"]))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.success("수정됨")
                         st.rerun()
                     if b2.button("🗑️ 삭제", key=f"vrdel_{vr['id']}", use_container_width=True):
                         conn = get_conn()
                         conn.execute("DELETE FROM vacation_rule_items WHERE id=?", (vr["id"],))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.rerun()
 
     elif nav == "adm_shop":
@@ -2553,43 +3092,55 @@ elif nav.startswith("adm_") and is_mgr:
         with ts1:
             with st.form("adm_shop"):
                 sn = st.text_input("새 상품명 *")
-                c1, c2 = st.columns(2)
+                c1, c2, c3 = st.columns(3)
                 sp = c1.number_input("필요 포인트", 1, 10000, 10)
                 ss = c2.number_input("재고", 0, 9999, 10)
+                sea = c3.checkbox("🌟 M3/M4 1일 선예매 적용", value=True)
                 sd = st.text_input("상품 설명")
                 if st.form_submit_button("➕ 상품 등록", type="primary", use_container_width=True) and sn.strip():
+                    now_rel = now_kst().strftime("%Y-%m-%d %H:%M:%S")
                     conn = get_conn()
-                    conn.execute("INSERT INTO shop_items (item_name, price, description, stock) VALUES (?,?,?,?)", (sn.strip(), sp, sd, ss))
+                    conn.execute(
+                        "INSERT INTO shop_items (item_name, price, description, stock, early_access_days, released_at) VALUES (?,?,?,?,?,?)",
+                        (sn.strip(), sp, sd, ss, 1 if sea else 0, now_rel),
+                    )
                     conn.commit()
-                    conn.close()
+                    _release_conn(conn)
                     st.rerun()
             conn = get_conn()
             s_items = [dict(r) for r in conn.execute("SELECT * FROM shop_items ORDER BY price ASC").fetchall()]
-            conn.close()
+            _release_conn(conn)
             for it in s_items:
                 with st.container(border=True):
                     en = st.text_input("상품명", value=it["item_name"], key=f"sin_{it['id']}")
-                    c1, c2 = st.columns(2)
+                    c1, c2, c3 = st.columns(3)
                     ep = c1.number_input("가격(P)", 1, 10000, it["price"], key=f"sip_{it['id']}")
                     es = c2.number_input("재고", 0, 9999, it["stock"], key=f"sis_{it['id']}")
+                    eea = c3.checkbox("🌟 M3/M4 1일 선예매", value=(int(it.get("early_access_days") or 0) > 0), key=f"siea_{it['id']}")
                     ed = st.text_input("설명", value=it["description"] or "", key=f"sid_{it['id']}")
                     b1, b2 = st.columns(2)
                     if b1.button("💾 수정", key=f"siu_{it['id']}", use_container_width=True):
+                        rel_t = it.get("released_at") or now_kst().strftime("%Y-%m-%d %H:%M:%S")
+                        if eea and int(it.get("early_access_days") or 0) == 0:
+                            rel_t = now_kst().strftime("%Y-%m-%d %H:%M:%S")
                         conn = get_conn()
-                        conn.execute("UPDATE shop_items SET item_name=?, price=?, stock=?, description=? WHERE id=?", (en, ep, es, ed, it["id"]))
+                        conn.execute(
+                            "UPDATE shop_items SET item_name=?, price=?, stock=?, description=?, early_access_days=?, released_at=? WHERE id=?",
+                            (en, ep, es, ed, 1 if eea else 0, rel_t, it["id"]),
+                        )
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.rerun()
                     if b2.button("🗑️ 삭제", key=f"di_{it['id']}", use_container_width=True):
                         conn = get_conn()
                         conn.execute("DELETE FROM shop_items WHERE id=?", (it["id"],))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.rerun()
         with ts2:
             conn = get_conn()
             orders = [dict(r) for r in conn.execute("SELECT o.*, m.nickname FROM shop_orders o JOIN members m ON o.member_id=m.id ORDER BY o.id DESC").fetchall()]
-            conn.close()
+            _release_conn(conn)
             for o in orders:
                 with st.container(border=True):
                     st.markdown(f"**{o['nickname']}** ➔ `{o['item_name']}` ({o['price']}P)")
@@ -2598,7 +3149,7 @@ elif nav.startswith("adm_") and is_mgr:
                         conn = get_conn()
                         conn.execute("UPDATE shop_orders SET status=? WHERE id=?", (ns, o["id"]))
                         conn.commit()
-                        conn.close()
+                        _release_conn(conn)
                         st.rerun()
 
     elif nav == "adm_logs":
@@ -2607,7 +3158,7 @@ elif nav.startswith("adm_") and is_mgr:
         ql = st.text_input("아이디 · 닉네임 · 활동 검색")
         conn = get_conn()
         alogs = [dict(r) for r in conn.execute("SELECT * FROM activity_logs ORDER BY id DESC LIMIT 500").fetchall()]
-        conn.close()
+        _release_conn(conn)
         if alogs:
             df_a = pd.DataFrame(alogs)
             if af != "전체":
@@ -2662,27 +3213,34 @@ elif nav.startswith("adm_") and is_mgr:
                             pass
                 conn.execute("DELETE FROM logs WHERE id=?", (tl["id"],))
                 conn.commit()
-                conn.close()
+                _release_conn(conn)
                 st.success("취소 및 원상복구 완료!")
                 st.rerun()
 
     elif nav == "adm_settle":
-        st.subheader("🔄 월말 결산 (리셋 & 이월)")
+        st.subheader("🔄 월말 결산 (리셋 & 이월 · 등급별 수수료 절감 반영)")
         cpct = get_opt_int("monthly_carryover_pct", 60)
-        st.warning(f"⚠️ 실행 시 활동중 부방 포인트가 0P로 리셋되고 기존 포인트의 **{cpct}%(내림)**가 휴가로 이월됩니다.")
+        st.warning(
+            f"⚠️ 실행 시 활동중 부방 포인트가 0P로 리셋되고 기본 **{cpct}%** + **등급별 결산 수수료 절감(M1 0% / M2 +5% / M3 +10% / M4 +15%)**이 합산된 비율(최대 100%, 내림)만큼 휴가로 이월됩니다."
+        )
         if st.button("🚀 월말 결산 실행", type="primary", use_container_width=True):
             conn = get_conn()
             now = now_kst().strftime("%Y-%m-%d %H:%M:%S")
             for m in conn.execute("SELECT * FROM members WHERE status='활동중'").fetchall():
                 if m["points"] > 0:
-                    cv = math.floor(m["points"] * (cpct / 100.0))
+                    disc_pct = get_grade_fee_discount_pct(m["grade"])
+                    eff_pct = min(100, cpct + disc_pct)
+                    cv = math.floor(m["points"] * (eff_pct / 100.0))
                     rg = m["grade"] if m["grade"] in ["MP", "MS"] else "M1"
                     conn.execute("UPDATE members SET points=0, grade=?, vacation_days=vacation_days+? WHERE id=?", (rg, cv, m["id"]))
-                    conn.execute("INSERT INTO logs (member_id, season, week, log_type, category, minutes, points_delta, vacation_delta, memo, created_at) VALUES (?,'시즌결산','결산주차','월간결산','포인트리셋/휴가이월',0,?,?,?,?)", (m["id"], -m["points"], cv, f"월말 결산: {m['points']}P ➔ {cpct}%({cv}일) 이월", now))
-                    st.write(f"- [{m['grade']}] {m['nickname']}: {m['points']}P ➔ 휴가 +{cv}일")
+                    conn.execute(
+                        "INSERT INTO logs (member_id, season, week, log_type, category, minutes, points_delta, vacation_delta, memo, created_at) VALUES (?,'시즌결산','결산주차','월간결산','포인트리셋/휴가이월',0,?,?,?,?)",
+                        (m["id"], -m["points"], cv, f"월말 결산: {m['points']}P ➔ 기본{cpct}%+등급절감{disc_pct}%={eff_pct}%({cv}일) 이월", now),
+                    )
+                    st.write(f"- [{m['grade']}] {m['nickname']}: {m['points']}P ➔ ({cpct}%+{disc_pct}%={eff_pct}%) 휴가 +{cv}일")
             conn.commit()
-            conn.close()
-            send_phone_push("📊 월말 결산 완료", f"포인트 리셋 및 {cpct}% 휴가 이월이 완료되었습니다.")
+            _release_conn(conn)
+            send_phone_push("📊 월말 결산 완료", f"포인트 리셋 및 등급별 수수료 절감 반영 휴가 이월이 완료되었습니다.")
             st.success("월말 결산 완료!")
 
     elif nav == "adm_db":
